@@ -279,7 +279,37 @@ function handleConnection(ws, req) {
 			return { path: rel, size: st.size };
 		},
 
-		commit: async ({ planId }) => {
+		// Is there already a logged-in session for this host? Lets background
+		// sync run without ever triggering a passphrase/MFA prompt.
+		session: async ({ host }) => ({ active: sessions.has(host) }),
+
+		syncPlan: async ({ remoteDir, manifest, exclude }) => {
+			const session = requireSession();
+			const dir = sync.resolveRemoteDir(session.home, remoteDir);
+			const planned = await sync.syncPlan(session.sftp, dir, manifest, exclude);
+			const planId = crypto.randomUUID();
+			state.plans.set(planId, {
+				kind: 'sync',
+				dir,
+				planned,
+				uploadSet: new Set(planned.upload),
+				uploaded: new Map(),
+				dirCache: new Map(),
+			});
+			return {
+				planId,
+				remoteDir: dir,
+				upload: planned.upload,
+				download: planned.download,
+				deleteRemote: planned.deleteRemote,
+				deleteLocal: planned.deleteLocal,
+				serverWins: planned.serverWins,
+				unchanged: planned.unchanged.length,
+				adopted: planned.adopted.size,
+			};
+		},
+
+		commit: async ({ planId, downloaded, deletedLocal }) => {
 			const session = requireSession();
 			const p = state.plans.get(planId);
 			if (!p) throw new BridgeError('BAD_PLAN', 'Unknown or finished plan');
@@ -290,6 +320,29 @@ function handleConnection(ws, req) {
 					`${missing.length} planned files were not uploaded`,
 					{ missing },
 				);
+			}
+			if (p.kind === 'sync') {
+				const r = await sync.commitSync(
+					session.sftp,
+					p.dir,
+					p.planned,
+					p.uploaded,
+					{ downloaded, deletedLocal },
+					p.dirCache,
+				);
+				state.plans.delete(planId);
+				return {
+					remoteDir: p.dir,
+					uploaded: p.planned.upload.length,
+					bytes: [...p.uploaded.values()].reduce((n, s) => n + s.size, 0),
+					downloaded: r.downloaded,
+					deletedRemote: r.deletedRemote,
+					deletedLocal: r.deletedLocal,
+					serverWins: p.planned.serverWins,
+					notApplied: r.notApplied,
+					unchanged: p.planned.unchanged.length,
+					adopted: p.planned.adopted.size,
+				};
 			}
 			const { deleted } = await sync.commit(
 				session.sftp,

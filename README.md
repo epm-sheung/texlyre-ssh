@@ -1,40 +1,48 @@
 # TeXlyre + SSH
 
-Modified based on **[TeXlyre](https://github.com/TeXlyre/texlyre)**, the local-first LaTeX & Typst editor. This version adds **SSH/SFTP support**: open a paper that lives on any SSH server (an HPC cluster, a lab machine, a VPS), edit and compile it in the browser, and push your changes back.
+Modified based on **[TeXlyre](https://github.com/TeXlyre/texlyre)**, the local-first LaTeX & Typst editor. This version adds **SSH/SFTP support**: work on a paper that lives on any SSH server (an HPC cluster, a lab machine, a VPS) in the browser, and TeXlyre keeps it in sync with the server.
 
 ## What's new
 
-- **Import from server**: copy a folder from any SSH host into a TeXlyre project.
-- **Push via SFTP**: upload only the files you changed.
-- **Safe by default**: files edited on the server are never overwritten (unless you Force push), and nothing TeXlyre didn't create is ever deleted, so build outputs next to your paper are left alone.
+- **Two-way sync with the server**: edits you make in TeXlyre are uploaded, and changes made on the server come into TeXlyre. Only changed files are transferred.
+- **The server is the source of truth**: when the same file changed on both sides, the server version wins and your TeXlyre version is saved under `.texlyre/sftp-conflicts/<time>/`, so nothing is lost. **Force push** is there for when you want the TeXlyre version to win.
+- **Automatic**: after your first **Sync now** in a project, it syncs in the background every 60 s while that project is open.
+- **Safe**: build outputs (`build/`, `.aux`, `.log`, …) are never synced. A file you're typing in is never overwritten mid-sentence. Background sync pauses instead of deleting more than 5 files at once.
 - **Works like `ssh`**: uses your `~/.ssh/config`, keys, `known_hosts`, ProxyJump/ProxyCommand, key passphrases, and MFA/Duo prompts. You can also type `user@host[:port]` directly.
-- **Folder browser and recent servers**: click through folders on the server instead of typing paths; switch servers in one click.
+- **Folder browser and recent servers**: click through folders on the server instead of typing paths, and switch servers in one click.
 - **One login per session**: MFA is asked once; the connection is reused until it's idle for 30 minutes.
+- **Compile ▶ finds the main file**: it compiles `main.tex` (or the file with `\documentclass`), not whichever file is open.
 
 Browsers can't open SSH connections, so a small local helper, [`sftp-bridge/`](sftp-bridge/README.md), holds the connection on your machine. Your keys never leave `~/.ssh`.
 
 ## Quick start
 
-Requires [Node.js](https://nodejs.org/) 20+. Use two terminals and keep both open.
+Requires [Node.js](https://nodejs.org/) 20+. Clone this repository, then start everything with one click:
 
-Terminal 1, TeXlyre:
+| System | Launcher |
+| --- | --- |
+| Windows | Double-click **`Start TeXlyre.bat`** |
+| macOS | Double-click **`Start TeXlyre.command`** (the first time: right-click → Open) |
+| Linux | Run **`./start-texlyre.sh`** in a terminal |
+
+The launcher installs dependencies on first use, starts the TeXlyre dev server and the SFTP bridge, and opens TeXlyre in your browser. It also passes the bridge token to TeXlyre, so there is nothing to paste. On Windows, TeXlyre and the bridge run in two windows; on macOS/Linux, in the launcher's terminal. Keep them open while you work; closing them (or Ctrl+C) stops TeXlyre.
+
+1. In TeXlyre, sign up. The account is local to your browser, so always use the same browser.
+2. Open a project, then click **Backup ▾ → SFTP → Connect over SFTP**.
+3. Enter a host, browse to the folder, and click **Use this folder**. The first sync runs right away and brings the server files in.
+4. Edit as usual. Changes go to the server within a minute, or click **Sync now**.
+
+<details>
+<summary>Starting it by hand instead</summary>
 
 ```bash
 npm install
-npm run dev
+npx vite --port 5173                     # TeXlyre at http://localhost:5173/texlyre/
+node sftp-bridge/bridge.cjs              # in a second terminal (after npm install in sftp-bridge/)
 ```
 
-Terminal 2, the bridge:
-
-```bash
-cd sftp-bridge
-npm install
-node bridge.cjs
-```
-
-1. Open `http://localhost:5173/texlyre/`, sign up (the account is local to your browser), and paste the `token:` printed by the bridge under **Settings → Backup → SFTP → Bridge token**. The token is saved, so this is a one-time step.
-2. Open a project, click **Backup ▾ → SFTP → Connect over SFTP**, enter a host, then browse to the folder and click **Use this folder**.
-3. **Import from server** brings the files in; **Push via SFTP** sends your changes back.
+Then paste the `token:` printed by the bridge under **Settings → Backup → SFTP → Bridge token** (once; the token is saved). `npm run dev` also works, and additionally downloads TeXlyre's optional assets (TeX Live 2026 engine, draw.io, TikZ editor, ~550 MB).
+</details>
 
 ## Using it with Compute Canada (Digital Research Alliance of Canada)
 
@@ -74,16 +82,19 @@ This works with the Alliance clusters (for example Fir, Nibi, Narval, Rorqual), 
 
 ### 3. Connect from TeXlyre
 
-1. Start TeXlyre and the bridge (see [Quick start](#quick-start)).
+1. Start TeXlyre with the launcher (see [Quick start](#quick-start)).
 2. Create or open a project, then click **Backup ▾ → SFTP → Connect over SFTP**.
 3. Enter the host alias, e.g. `fir`, and click **Connect**.
 4. The Duo prompt appears **inside TeXlyre** (`Passcode or option (1-1):`). Type `1` for a Duo Push and approve it on your phone, or type a passcode. You have 3 minutes to answer.
 
-After that, pushes, imports, page reloads and switching projects reuse the same login. You'll only be asked for Duo again after 30 minutes without activity, or when you restart the bridge.
+After that, syncs, page reloads and switching projects reuse the same login. You'll only be asked for Duo again after 30 minutes without activity, or when the bridge restarts. Background sync never asks for Duo by itself: after a restart it waits until you click **Sync now**.
 
 ### 4. Choose the folder
 
 The folder browser starts in your home directory. `projects` and `scratch` there are links to the cluster's shared filesystems, and the browser follows them. Click through to your paper, for example `projects/def-<sponsor>/<username>/my-paper`, then click **Use this folder**.
+
+- **Existing paper on the cluster:** the first sync copies it into the project (skipping `build/`, `.git` and LaTeX temporary files; see Settings → Backup → SFTP → Import exclude patterns). Use a new, empty project for this.
+- **New paper:** browse to the parent folder, add the new folder's name to the path in the **Folder** box (e.g. `.../my-new-paper`), and click **Use this folder**. The folder is created and filled with your project files.
 
 Where to keep a paper:
 
@@ -95,15 +106,15 @@ Where to keep a paper:
 
 Check [Storage and file management](https://docs.alliancecan.ca/wiki/Storage_and_file_management) for current quotas and purge rules.
 
-### 5. Import, edit, push
+### 5. Day to day
 
-- **Existing paper on the cluster:** click **Import from server**. It skips `build/`, `.git`, and LaTeX temporary files (`.aux`, `.log`, …); change this under Settings → Backup → SFTP → Import exclude patterns. TeXlyre records the server state right after the import, so the first push uploads nothing.
-- **New paper:** in step 4, browse to the parent folder, add the new folder's name to the path in the **Folder** box (e.g. `.../my-new-paper`), and click **Use this folder**. Then skip the import and click **Push via SFTP**; the folder is created and filled with your project files.
-- **Day to day:** edit and compile in TeXlyre, then **Push via SFTP**. Only changed files are uploaded. You can still compile on the cluster in the same folder, since it's a normal directory there.
+- **Edit and compile in TeXlyre.** Your changes reach the cluster within a minute, or immediately with **Sync now**. The folder on the cluster is a normal directory, so `latexmk` there still works.
+- **Edits made on the cluster** (by you, a co-author, or a script) show up in TeXlyre on the next sync.
+- **Both sides edited the same file:** the cluster version wins. Your TeXlyre version is in the project under `.texlyre/sftp-conflicts/<time>/`.
+- **Sync now** asks before large deletions, and before a cluster version replaces your edits.
 
 ### Tips
 
-- **Edits made on the cluster** (by you, a co-author, or a script) are never overwritten; TeXlyre lists them as conflicts. To bring them into TeXlyre, push first, then click **Import from server** again. The import replaces the local copies of same-named files.
 - **Compute nodes:** there's no need to connect to them. Home, project and scratch are shared across the cluster, so the login node sees the same files. An SSH alias that reaches compute nodes through `ProxyCommand ssh -W …` won't work here, because that inner `ssh` can't show the Duo prompt.
 - **Several clusters:** each one is a separate login with its own Duo approval. Use **Change server**, or the **Recent** buttons, to switch.
 - **Terminal commands** such as `ssh`, `scp` or `rsync` are separate logins and ask for Duo on their own. That's expected.
@@ -112,12 +123,13 @@ Check [Storage and file management](https://docs.alliancecan.ca/wiki/Storage_and
 
 | Message | What to do |
 | --- | --- |
-| Cannot reach the SFTP bridge | Start the bridge (`node bridge.cjs` in `sftp-bridge/`) and keep its terminal open. |
-| The bridge rejected the token | Paste the `token:` line printed by the bridge into Settings → Backup → SFTP. |
+| Cannot reach the SFTP bridge | Start TeXlyre with the launcher, or run `node sftp-bridge/bridge.cjs`, and keep that window open. |
+| The bridge rejected the token | Open TeXlyre with the launcher (it passes the token), or paste the `token:` line printed by the bridge into Settings → Backup → SFTP. |
 | Host key … is not in known_hosts | Run `ssh <alias>` once in a terminal and accept the key. |
 | HOST KEY MISMATCH | Stop. Check the Alliance status page or announcements for a host key change before editing `known_hosts`. |
 | Authentication failed | Check the key is registered in CCDB, and the `User` / `IdentityFile` lines in your SSH config. Also make sure the Duo request was approved within 3 minutes. |
 | Folder … was not found | Click **Change server** and browse to the folder. |
+| Auto-sync paused | Many files would be deleted (e.g. a scratch purge). Click **Sync now** to review what would change. |
 
 ## Everything else
 
@@ -125,4 +137,4 @@ All other features (real-time collaboration, in-browser LaTeX/Typst compilation,
 
 ## License
 
-AGPL-3.0, same as TeXlyre. This is a modified version of TeXlyre: the SFTP backup plugin (`extras/backup/sftp/`), the local bridge (`sftp-bridge/`), and small supporting changes were added in September 2026. All credit for TeXlyre itself goes to the [TeXlyre authors](https://github.com/TeXlyre/texlyre).
+AGPL-3.0, same as TeXlyre. This is a modified version of TeXlyre: the SFTP sync plugin (`extras/backup/sftp/`), the local bridge (`sftp-bridge/`), the launchers, and small supporting changes were added in September 2026. All credit for TeXlyre itself goes to the [TeXlyre authors](https://github.com/TeXlyre/texlyre).

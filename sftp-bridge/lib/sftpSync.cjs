@@ -1,8 +1,10 @@
 // lib/sftpSync.cjs
-// Push-only mirror of a TeXlyre project into a remote directory.
+// Sync of a TeXlyre project with a remote directory.
 //
 // The remote directory holds a .texlyre-sync.json with {sha256, size, mtime}
-// for every file the bridge last wrote. That lets a push:
+// for every file as of the last sync. syncPlan/commitSync use it for two-way
+// sync (server wins when both sides changed). The push-only plan/commit
+// (used by Force push) use it to:
 //   - skip files whose content did not change,
 //   - refuse to overwrite files edited on the server since the last push
 //     (size/mtime drift) or files it never wrote, unless `force`,
@@ -294,6 +296,257 @@ async function commit(sftp, remoteDir, planned, uploaded, dirCache) {
 	return { deleted };
 }
 
+// A path is excluded when it, or any folder above it, matches a pattern.
+function excludedBy(matchers, rel) {
+	const segments = rel.split('/');
+	for (let i = 0; i < segments.length; i++) {
+		const sub = segments.slice(0, i + 1).join('/');
+		if (
+			matchers.some(({ re, onPath }) => re.test(onPath ? sub : segments[i]))
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Two-way sync against the .texlyre-sync.json baseline (the state both sides
+// had after the last sync). Changes on one side flow to the other; when both
+// sides changed (or one deleted what the other edited) the SERVER wins, and
+// the caller keeps a copy of the local version.
+//   upload       local changed / new           -> put to server
+//   download     server changed / new          -> write locally
+//   deleteRemote deleted locally, server same  -> delete on server
+//   deleteLocal  deleted on server, local same -> delete locally
+//   serverWins   both changed                  -> {action: download|deleteLocal}
+async function syncPlan(sftp, remoteDir, manifest, exclude) {
+	const fsx = wrapSftp(sftp);
+	if (!Array.isArray(manifest)) {
+		throw new BridgeError('BAD_REQUEST', 'manifest must be an array');
+	}
+	const matchers = compileExcludes(exclude);
+
+	const local = new Map();
+	for (const entry of manifest) {
+		const rel = cleanRelPath(entry.path);
+		if (!/^[0-9a-f]{64}$/.test(entry.sha256 || '')) {
+			throw new BridgeError('BAD_REQUEST', `Bad sha256 for ${entry.path}`);
+		}
+		if (!excludedBy(matchers, rel)) local.set(rel, entry.sha256);
+	}
+
+	const state = await readState(fsx, remoteDir);
+	let remoteFiles = [];
+	try {
+		remoteFiles = (await listTree(sftp, remoteDir, exclude)).files;
+	} catch (err) {
+		if (err.code !== 'NOT_FOUND') throw err; // new folder: nothing there yet
+	}
+	const remote = new Map(remoteFiles.map((f) => [f.path, f]));
+	const tracked = Object.keys(state.files).filter(
+		(rel) => !excludedBy(matchers, rel),
+	);
+	const all = [...new Set([...local.keys(), ...remote.keys(), ...tracked])];
+
+	const result = {
+		upload: [],
+		download: [],
+		deleteRemote: [],
+		deleteLocal: [],
+		serverWins: [],
+		unchanged: [],
+		untrack: [],
+		adopted: new Map(),
+	};
+
+	const hashCache = new Map();
+	const remoteHash = (rel) => {
+		const st = remote.get(rel);
+		if (!st || st.size > ADOPT_MAX_BYTES) return Promise.resolve(null);
+		if (!hashCache.has(rel)) {
+			hashCache.set(
+				rel,
+				fsx.readFile(`${remoteDir}/${rel}`).then(sha256, () => null),
+			);
+		}
+		return hashCache.get(rel);
+	};
+	const statOf = (rel) => ({
+		size: remote.get(rel).size,
+		mtime: remote.get(rel).mtime,
+	});
+
+	const decide = async (rel) => {
+		const L = local.get(rel);
+		const B = state.files[rel];
+		const R = remote.get(rel);
+		const remoteChanged = async () =>
+			!sameStat(R, B) && (await remoteHash(rel)) !== B.sha256;
+		const same = async () => {
+			if (!sameStat(R, B)) result.adopted.set(rel, statOf(rel));
+			result.unchanged.push(rel);
+		};
+
+		if (L && R) {
+			if (B) {
+				const localChanged = L !== B.sha256;
+				const serverChanged = await remoteChanged();
+				if (!localChanged && !serverChanged) await same();
+				else if (localChanged && !serverChanged) result.upload.push(rel);
+				else if (!localChanged && serverChanged) result.download.push(rel);
+				else if ((await remoteHash(rel)) === L) await same();
+				else
+					result.serverWins.push({
+						path: rel,
+						action: 'download',
+						reason: 'changed-on-both',
+					});
+			} else if ((await remoteHash(rel)) === L) {
+				await same();
+			} else {
+				result.serverWins.push({
+					path: rel,
+					action: 'download',
+					reason: 'differs-from-server',
+				});
+			}
+		} else if (L) {
+			if (!B) result.upload.push(rel);
+			else if (L === B.sha256) result.deleteLocal.push(rel);
+			else
+				result.serverWins.push({
+					path: rel,
+					action: 'deleteLocal',
+					reason: 'deleted-on-server',
+				});
+		} else if (R) {
+			if (!B) result.download.push(rel);
+			else if (await remoteChanged()) {
+				result.serverWins.push({
+					path: rel,
+					action: 'download',
+					reason: 'changed-on-server',
+				});
+			} else result.deleteRemote.push(rel);
+		} else {
+			result.untrack.push(rel);
+		}
+	};
+	await mapLimit(all, HASH_CONCURRENCY, decide);
+
+	for (const key of [
+		'upload',
+		'download',
+		'deleteRemote',
+		'deleteLocal',
+		'unchanged',
+		'untrack',
+	]) {
+		result[key].sort();
+	}
+	result.serverWins.sort((a, b) => a.path.localeCompare(b.path));
+	return { ...result, state, local, remote };
+}
+
+// Writes the new baseline after the client applied a sync plan.
+// `downloaded`: [{path, sha256}] the client wrote locally; `deletedLocal`:
+// paths it deleted locally. Planned changes the client did not confirm keep
+// their old baseline entry, so the next sync judges them again.
+async function commitSync(
+	sftp,
+	remoteDir,
+	planned,
+	uploaded,
+	{ downloaded, deletedLocal },
+	dirCache,
+) {
+	const fsx = wrapSftp(sftp);
+	for (const rel of planned.deleteRemote) {
+		try {
+			await fsx.unlink(`${remoteDir}/${rel}`);
+		} catch (err) {
+			if (err.code !== SFTP_NO_SUCH_FILE) throw err;
+		}
+	}
+
+	const wantDownload = new Set([
+		...planned.download,
+		...planned.serverWins
+			.filter((w) => w.action === 'download')
+			.map((w) => w.path),
+	]);
+	const goneLocally = new Set([
+		...planned.deleteLocal,
+		...planned.serverWins
+			.filter((w) => w.action === 'deleteLocal')
+			.map((w) => w.path),
+	]);
+	const gotDown = new Map();
+	for (const d of downloaded || []) {
+		const rel = cleanRelPath(d.path);
+		if (!wantDownload.has(rel)) {
+			throw new BridgeError(
+				'NOT_PLANNED',
+				`${rel} was not planned for download`,
+			);
+		}
+		gotDown.set(rel, d.sha256);
+	}
+
+	const confirmedGone = new Set();
+	for (const p of deletedLocal || []) {
+		const rel = cleanRelPath(p);
+		if (!goneLocally.has(rel)) {
+			throw new BridgeError(
+				'NOT_PLANNED',
+				`${rel} was not planned for local deletion`,
+			);
+		}
+		confirmedGone.add(rel);
+	}
+
+	const files = {};
+	for (const [rel, hash] of planned.local) {
+		if (confirmedGone.has(rel) || gotDown.has(rel)) continue;
+		if (goneLocally.has(rel) || wantDownload.has(rel)) {
+			// Planned but not applied locally: judge it again next time.
+			if (planned.state.files[rel]) files[rel] = planned.state.files[rel];
+			continue;
+		}
+		const up = uploaded.get(rel) || planned.adopted.get(rel);
+		if (up) files[rel] = { sha256: hash, size: up.size, mtime: up.mtime };
+		else if (planned.state.files[rel]) files[rel] = planned.state.files[rel];
+	}
+	for (const [rel, hash] of gotDown) {
+		const st = planned.remote.get(rel);
+		if (st) files[rel] = { sha256: hash, size: st.size, mtime: st.mtime };
+	}
+
+	await mkdirp(fsx, remoteDir, dirCache);
+	await fsx.writeFile(
+		`${remoteDir}/${STATE_FILE}`,
+		JSON.stringify(
+			{
+				version: 1,
+				tool: 'texlyre-sftp-bridge',
+				updatedAt: new Date().toISOString(),
+				files,
+			},
+			null,
+			1,
+		),
+	);
+	return {
+		deletedRemote: planned.deleteRemote.length,
+		downloaded: gotDown.size,
+		deletedLocal: confirmedGone.size,
+		notApplied: [
+			...[...wantDownload].filter((rel) => !gotDown.has(rel)),
+			...[...goneLocally].filter((rel) => !confirmedGone.has(rel)),
+		].sort(),
+	};
+}
+
 // Exclude patterns: without "/" they match the basename (so "build" prunes
 // every directory named build, "*.aux" every aux file); with "/" they match
 // the path relative to the remote directory. "*" does not cross "/".
@@ -459,7 +712,9 @@ module.exports = {
 	STATE_FILE,
 	cleanRelPath,
 	commit,
+	commitSync,
 	getFile,
+	syncPlan,
 	listDirs,
 	listTree,
 	plan,

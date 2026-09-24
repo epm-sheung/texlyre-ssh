@@ -1,9 +1,10 @@
 // extras/backup/sftp/SftpBackupService.ts
-// SFTP backup through the local texlyre-sftp-bridge. Mirrors the plain
-// project tree (main.tex, figures/, ...) to a server folder so it can be
-// compiled or versioned there, rather than TeXlyre's backup layout. Import
-// copies an existing server folder into the project once; after that,
-// pushes only upload changes.
+// SFTP sync through the local texlyre-sftp-bridge. Keeps the plain project
+// tree (main.tex, figures/, ...) identical to a server folder: server changes
+// come in, TeXlyre edits go out, and the server wins when both changed (the
+// local version is kept under .texlyre/sftp-conflicts/). After the first
+// manual sync of a project it also runs in the background while that
+// project is open. Force push is the explicit "TeXlyre wins" override.
 import { nanoid } from 'nanoid';
 import { t } from '@/i18n';
 import { createNamedLogger } from '@/logging';
@@ -18,7 +19,13 @@ import { ProjectDataService } from '@/services/ProjectDataService';
 import type { BackupActivity, BackupStatus } from '@/types/backup';
 import type { FileNode } from '@/types/files';
 import { getMimeType, isBinaryFile, isTemporaryFile } from '@/utils/fileUtils';
-import { SFTP_DEFAULT_BRIDGE_URL } from './settings';
+import {
+	SFTP_DEFAULT_AUTO_SYNC_SECONDS,
+	SFTP_DEFAULT_BRIDGE_URL,
+	SFTP_DEFAULT_IMPORT_EXCLUDE,
+} from './settings';
+import { applySyncPlan, type SyncPlan } from './syncApply';
+import { collabService } from '@/services/CollabService';
 import {
 	type BridgePrompt,
 	BridgeRequestError,
@@ -31,6 +38,24 @@ import {
 const moduleLog = createNamedLogger('SftpBackupService');
 
 const PLUGIN_ID = 'texlyre-sftp-backup';
+const PAIRED_TOKEN_KEY = 'texlyre-sftp-bridge-token';
+const PAIR_PARAM = 'sftp-bridge-token';
+
+// The Start TeXlyre launchers open TeXlyre with ?sftp-bridge-token=… so the bridge
+// token never has to be copied by hand. Keep it and drop it from the URL.
+function capturePairedToken(): void {
+	try {
+		const url = new URL(window.location.href);
+		const token = url.searchParams.get(PAIR_PARAM);
+		if (!token) return;
+		localStorage.setItem(PAIRED_TOKEN_KEY, token);
+		url.searchParams.delete(PAIR_PARAM);
+		window.history.replaceState(window.history.state, '', url.toString());
+	} catch {
+		// No window/localStorage (tests, private mode): manual token still works.
+	}
+}
+capturePairedToken();
 const TARGETS_STORAGE_KEY = 'texlyre-sftp-backup-targets';
 const RECENT_STORAGE_KEY = 'texlyre-sftp-backup-recent';
 const RECENT_LIMIT = 6;
@@ -43,6 +68,88 @@ export interface SftpBackupSettings {
 	importExclude?: string[];
 	maxFileSize?: number;
 	activityHistoryLimit?: number;
+	autoSync?: boolean;
+	autoSyncSeconds?: number;
+}
+
+const splitList = (value: unknown): string[] | undefined =>
+	typeof value === 'string'
+		? value
+				.split(',')
+				.map((s) => s.trim())
+				.filter(Boolean)
+		: undefined;
+
+// Background sync runs without the SFTP modal mounted, so read the saved
+// TeXlyre settings directly (same storage key as SettingsContext).
+function readStoredSettings(): SftpBackupSettings {
+	try {
+		const userId = localStorage.getItem('texlyre-current-user');
+		const raw = localStorage.getItem(
+			userId ? `texlyre-user-${userId}-settings` : 'texlyre-settings',
+		);
+		const s = raw ? JSON.parse(raw) : {};
+		const pick = <T>(id: string, type: string): T | undefined =>
+			typeof s[id] === type ? (s[id] as T) : undefined;
+		return {
+			bridgeUrl: pick<string>('sftp-backup-bridge-url', 'string'),
+			bridgeToken: pick<string>('sftp-backup-bridge-token', 'string'),
+			ignorePatterns: splitList(s['sftp-backup-ignore-patterns']),
+			importExclude:
+				splitList(s['sftp-backup-import-exclude']) ??
+				splitList(SFTP_DEFAULT_IMPORT_EXCLUDE),
+			maxFileSize: pick<number>('sftp-backup-max-file-size', 'number'),
+			activityHistoryLimit: pick<number>(
+				'sftp-backup-activity-history-limit',
+				'number',
+			),
+			autoSync: pick<boolean>('sftp-backup-auto-sync', 'boolean') ?? true,
+			autoSyncSeconds:
+				pick<number>('sftp-backup-auto-sync-interval', 'number') ??
+				SFTP_DEFAULT_AUTO_SYNC_SECONDS,
+		};
+	} catch {
+		return {};
+	}
+}
+
+// Never synced in either direction (matches isTemporaryFile).
+const ALWAYS_EXCLUDE = [
+	'.texlyre',
+	'.git',
+	'.svn',
+	'node_modules',
+	'.DS_Store',
+];
+
+// Background sync pauses instead of deleting more files than this in a round.
+const MAX_AUTO_DELETES = 5;
+
+export interface SftpSyncPreview {
+	host: string;
+	remoteDir: string;
+	download: number;
+	upload: number;
+	deleteLocal: number;
+	deleteRemote: number;
+	serverWins: string[];
+}
+
+export interface SftpSummary {
+	kind: 'sync' | 'push';
+	remoteDir: string;
+	uploaded: number;
+	downloaded: number;
+	deletedLocal: number;
+	deletedRemote: number;
+	unchanged: number;
+	adopted: number;
+	serverWins: { path: string; reason: string }[];
+	backups: string[];
+	skipped: string[];
+	conflicts: { path: string; reason: string }[];
+	remoteEdited: string[];
+	ms: number;
 }
 
 export interface SftpRemoteListing {
@@ -77,6 +184,9 @@ export interface SftpImportSummary {
 export interface SftpTarget {
 	host: string;
 	remoteDir: string;
+	// Set by the first manual "Sync now" for this project; background sync
+	// never starts on a project the user hasn't synced by hand.
+	autoSync?: boolean;
 }
 
 export interface SftpBackupStatus extends BackupStatus {
@@ -84,6 +194,8 @@ export interface SftpBackupStatus extends BackupStatus {
 	remoteDir?: string;
 	remoteHome?: string;
 	bridgeConnected?: boolean;
+	// Background sync: running, waiting for a manual login, or turned off.
+	autoSync?: 'on' | 'waiting-login' | 'waiting-confirm' | 'off';
 }
 
 export interface SftpPushSummary {
@@ -138,16 +250,25 @@ class SftpBackupService {
 	private listeners: Array<(status: SftpBackupStatus) => void> = [];
 	private activities: BackupActivity[] = [];
 	private activityListeners: Array<(activities: BackupActivity[]) => void> = [];
-	private summaryListeners: Array<(summary: SftpPushSummary | null) => void> =
-		[];
-	private lastSummary: SftpPushSummary | null = null;
+	private summaryListeners: Array<(summary: SftpSummary | null) => void> = [];
+	private lastSummary: SftpSummary | null = null;
 
+	// Saved settings, overridden by the live values the modal passes in.
 	private settings: SftpBackupSettings = {};
+	private uiSettings: SftpBackupSettings = {};
+	// One sync/push/import at a time, manual or background.
+	private busy = false;
+	private autoTimer: ReturnType<typeof setInterval> | null = null;
+	private lastAutoAttempt = 0;
+	private lastAutoError = '';
+	private reportedTooLarge = new Set<string>();
 	private recordsContext: RecordsContextType | null = null;
 	private currentProjectId: string | undefined;
 	private promptHandler:
 		| ((prompt: BridgePrompt) => Promise<string[] | null>)
 		| null = null;
+
+	private onTokenAccepted: ((token: string) => void) | null = null;
 
 	private client = new SftpBridgeClient();
 	private dataService = new ProjectDataService();
@@ -165,7 +286,16 @@ class SftpBackupService {
 	}
 
 	setSettings(settings: SftpBackupSettings): void {
-		this.settings = { ...settings };
+		this.uiSettings = { ...settings };
+		this.refreshSettings();
+	}
+
+	private refreshSettings(): void {
+		const accepted = this.settings.bridgeToken;
+		this.settings = { ...readStoredSettings(), ...this.uiSettings };
+		// Keep a token the bridge accepted this session (see ensureBridge).
+		if (accepted && !this.uiSettings.bridgeToken)
+			this.settings.bridgeToken = accepted;
 	}
 
 	setRecordsContext(recordsContext: RecordsContextType): void {
@@ -306,9 +436,273 @@ class SftpBackupService {
 	}
 
 	async importChanges(projectId?: string): Promise<void> {
-		const id = projectId ?? this.currentProjectId;
-		const listing = await this.previewImport(id);
-		await this.importFromRemote(id, listing);
+		await this.sync(projectId ?? this.currentProjectId);
+	}
+
+	// Two-way sync: server changes come in, TeXlyre edits go out. When a
+	// file changed on both sides the server version wins and the local one
+	// is saved under .texlyre/sftp-conflicts/. With `auto`, never prompts
+	// for a login and never touches a project that isn't open.
+	async sync(
+		projectId: string | undefined,
+		{
+			auto = false,
+			confirm,
+		}: {
+			auto?: boolean;
+			// Manual syncs: asked before deletions beyond the safety limit or
+			// before server versions replace local edits.
+			confirm?: (preview: SftpSyncPreview) => Promise<boolean>;
+		} = {},
+	): Promise<SftpSummary | null> {
+		const target = this.getStoredTarget(projectId);
+		if (!projectId || !target) {
+			if (!auto) {
+				this.handleError(
+					new Error(t('Open a project and choose an SFTP target first')),
+					'backup_error',
+					t('SFTP sync failed'),
+				);
+			}
+			return null;
+		}
+		if (this.busy) return null;
+		this.busy = true;
+		const started = performance.now();
+		try {
+			this.refreshSettings();
+			const project = await authService.getProjectById(projectId);
+			if (!project?.docUrl) throw new Error(t('Could not load projects.'));
+			const docId = project.docUrl.startsWith('yjs:')
+				? project.docUrl.slice(4)
+				: project.docUrl;
+
+			if (auto) {
+				if (!fileStoreService.isConnectedToProject(docId)) return null;
+				await this.ensureBridge();
+				const { active } = await this.client.request<{ active: boolean }>(
+					'session',
+					{ host: target.host },
+				);
+				if (!active) {
+					this.updateStatus({ autoSync: 'waiting-login' });
+					return null;
+				}
+			} else {
+				this.addActivity({
+					type: 'backup_start',
+					message: t('Syncing with {host}:{dir}...', {
+						host: target.host,
+						dir: target.remoteDir,
+					}),
+				});
+			}
+			this.updateStatus({ status: 'syncing', error: undefined });
+
+			const { entries, tooLarge } = await this.collectFiles(project);
+			const info = await this.connectHost(target.host);
+			const exclude = [
+				...(this.settings.importExclude || []),
+				...(this.settings.ignorePatterns || []),
+				...ALWAYS_EXCLUDE,
+				// Skipped for size, not deleted: keep the server copy.
+				...tooLarge.map((p) => p.replace(/^\/+/, '')),
+			];
+			const plan = await this.client.request<
+				SyncPlan & { remoteDir: string; unchanged: number; adopted: number }
+			>('syncPlan', {
+				remoteDir: target.remoteDir,
+				manifest: entries.map((e) => ({ path: e.path, sha256: e.sha256 })),
+				exclude,
+			});
+
+			const preview: SftpSyncPreview = {
+				host: target.host,
+				remoteDir: plan.remoteDir,
+				download: plan.download.length,
+				upload: plan.upload.length,
+				deleteLocal:
+					plan.deleteLocal.length +
+					plan.serverWins.filter((w) => w.action === 'deleteLocal').length,
+				deleteRemote: plan.deleteRemote.length,
+				serverWins: plan.serverWins.map((w) => w.path),
+			};
+			// A purge or an accidental mass delete on either side must not
+			// silently propagate: background sync pauses, manual sync asks.
+			const manyDeletes =
+				preview.deleteLocal > MAX_AUTO_DELETES ||
+				preview.deleteRemote > MAX_AUTO_DELETES;
+			if (auto && manyDeletes) {
+				this.updateStatus({ status: 'idle', autoSync: 'waiting-confirm' });
+				if (this.lastAutoError !== 'many-deletes') {
+					this.lastAutoError = 'many-deletes';
+					this.addActivity({
+						type: 'backup_error',
+						message: t(
+							'Auto-sync paused: it would delete {local} files here and {remote} on the server. Click "Sync now" to review.',
+							{ local: preview.deleteLocal, remote: preview.deleteRemote },
+						),
+					});
+				}
+				return null;
+			}
+			if (
+				!auto &&
+				confirm &&
+				(manyDeletes || preview.serverWins.length > 0) &&
+				!(await confirm(preview))
+			) {
+				this.updateStatus({ status: 'idle' });
+				this.addActivity({
+					type: 'backup_error',
+					message: t('Sync cancelled'),
+				});
+				return null;
+			}
+
+			const localFiles = new Map(
+				(await fileStoreService.getAllFiles(false)).map((f) => [f.path, f]),
+			);
+			const collected = new Map(
+				entries.map((e) => [e.path.replace(/^\/+/, ''), e.bytes]),
+			);
+			const applied = await applySyncPlan(plan, localFiles, collected, {
+				getRemote: async (rel) => {
+					const r = await this.client.request<{
+						content: string;
+						sha256: string;
+						mtime: number;
+					}>('get', { remoteDir: target.remoteDir, path: `/${rel}` });
+					const bytes = base64ToBytes(r.content);
+					if ((await sha256Hex(bytes)) !== r.sha256) {
+						throw new Error(t('Checksum mismatch for {path}', { path: rel }));
+					}
+					return { bytes, sha256: r.sha256, mtime: r.mtime };
+				},
+				putRemote: async (rel, bytes) => {
+					await this.client.request('put', {
+						planId: plan.planId,
+						path: `/${rel}`,
+						content: bytesToBase64(bytes),
+					});
+				},
+				storeFiles: async (nodes) => {
+					await fileStoreService.batchStoreFiles(nodes, {
+						showConflictDialog: false,
+						preserveTimestamp: true,
+					});
+				},
+				deleteLocalFile: async (file) => {
+					await fileStoreService.deleteFile(file.id, {
+						showDeleteDialog: false,
+						allowLinkedFileDelete: true,
+					});
+				},
+				updateDocument: (documentId, updater) =>
+					collabService.updateDocumentContent(docId, documentId, updater),
+				newId: () => nanoid(),
+				mimeType: getMimeType,
+				isBinary: isBinaryFile,
+				now: () => Date.now(),
+			});
+
+			const result = await this.client.request<{
+				remoteDir: string;
+				uploaded: number;
+				downloaded: number;
+				deletedRemote: number;
+				deletedLocal: number;
+				unchanged: number;
+				adopted: number;
+			}>('commit', {
+				planId: plan.planId,
+				downloaded: applied.downloaded,
+				deletedLocal: applied.deletedLocal,
+			});
+			if (applied.downloaded.length || applied.deletedLocal.length) {
+				fileStorageEventEmitter.emitChange();
+			}
+
+			const summary: SftpSummary = {
+				kind: 'sync',
+				remoteDir: result.remoteDir,
+				uploaded: result.uploaded,
+				downloaded: result.downloaded,
+				deletedLocal: result.deletedLocal,
+				deletedRemote: result.deletedRemote,
+				unchanged: result.unchanged,
+				adopted: result.adopted,
+				serverWins: plan.serverWins.map((w) => ({
+					path: w.path,
+					reason: w.reason,
+				})),
+				backups: applied.backups,
+				skipped: [...applied.skipped, ...tooLarge],
+				conflicts: [],
+				remoteEdited: [],
+				ms: Math.round(performance.now() - started),
+			};
+			const changed =
+				summary.uploaded +
+					summary.downloaded +
+					summary.deletedLocal +
+					summary.deletedRemote >
+				0;
+			if (!auto || changed) this.reportSyncSummary(summary, target.host);
+			if (!auto && !target.autoSync) {
+				this.saveTarget(projectId, { ...target, autoSync: true });
+			}
+			this.lastAutoError = '';
+			this.updateStatus({
+				isConnected: true,
+				isEnabled: true,
+				status: 'idle',
+				lastSync: Date.now(),
+				host: target.host,
+				remoteDir: target.remoteDir,
+				remoteHome: info.home,
+				autoSync: this.settings.autoSync === false ? 'off' : 'on',
+			});
+			return summary;
+		} catch (error) {
+			moduleLog.error('SFTP sync failed:', error);
+			const message = this.errorMessage(error);
+			if (!auto || message !== this.lastAutoError) {
+				this.handleError(error, 'backup_error', t('SFTP sync failed'));
+			} else {
+				this.updateStatus({ status: 'error', error: message });
+			}
+			if (auto) this.lastAutoError = message;
+			return null;
+		} finally {
+			this.busy = false;
+		}
+	}
+
+	// Background sync for the project open in the editor.
+	startAutoSync(): void {
+		if (this.autoTimer || typeof window === 'undefined') return;
+		this.autoTimer = setInterval(() => void this.autoTick(), 5000);
+	}
+
+	private async autoTick(): Promise<void> {
+		if (this.busy) return;
+		this.refreshSettings();
+		if (this.settings.autoSync === false) {
+			if (this.status.autoSync !== 'off')
+				this.updateStatus({ autoSync: 'off' });
+			return;
+		}
+		const intervalMs =
+			Math.max(
+				15,
+				this.settings.autoSyncSeconds || SFTP_DEFAULT_AUTO_SYNC_SECONDS,
+			) * 1000;
+		if (Date.now() - this.lastAutoAttempt < intervalMs) return;
+		const projectId = sessionStorage.getItem('currentProjectId') || undefined;
+		if (!projectId || !this.getStoredTarget(projectId)?.autoSync) return;
+		this.lastAutoAttempt = Date.now();
+		await this.sync(projectId, { auto: true });
 	}
 
 	// Lists what an import would bring in, so the UI can confirm first.
@@ -494,6 +888,15 @@ class SftpBackupService {
 			return null;
 		}
 
+		if (this.busy) {
+			this.handleError(
+				new Error(t('A sync is already running; try again in a moment')),
+				'backup_error',
+				t('SFTP push failed'),
+			);
+			return null;
+		}
+		this.busy = true;
 		const started = performance.now();
 		this.updateStatus({ status: 'syncing', error: undefined });
 		this.addActivity({
@@ -564,12 +967,14 @@ class SftpBackupService {
 			moduleLog.error('SFTP push failed:', error);
 			this.handleError(error, 'backup_error', t('SFTP push failed'));
 			return null;
+		} finally {
+			this.busy = false;
 		}
 	}
 
 	getStatus = (): SftpBackupStatus => ({ ...this.status });
 	getActivities = (): BackupActivity[] => [...this.activities];
-	getLastSummary = (): SftpPushSummary | null => this.lastSummary;
+	getLastSummary = (): SftpSummary | null => this.lastSummary;
 
 	addStatusListener = (
 		cb: (status: SftpBackupStatus) => void,
@@ -590,7 +995,7 @@ class SftpBackupService {
 	};
 
 	addSummaryListener = (
-		cb: (summary: SftpPushSummary | null) => void,
+		cb: (summary: SftpSummary | null) => void,
 	): (() => void) => {
 		this.summaryListeners.push(cb);
 		return () => {
@@ -620,23 +1025,51 @@ class SftpBackupService {
 	private async ensureBridge(): Promise<void> {
 		if (this.client.isOpen) return;
 		const url = this.settings.bridgeUrl || SFTP_DEFAULT_BRIDGE_URL;
-		const token = (this.settings.bridgeToken || '').trim();
-		try {
-			await this.client.open(url, token);
-		} catch (error) {
-			if (error instanceof BridgeRequestError && error.code === 'BAD_TOKEN') {
-				throw new BridgeRequestError(
-					'BAD_TOKEN',
-					token
-						? t(
-								'The bridge rejected the token. Copy the token printed by the bridge into the SFTP settings.',
-							)
-						: t('Paste the token printed by the SFTP bridge first'),
-				);
+		// The token typed in Settings first, then the one the launcher passed in;
+		// whichever the bridge accepts is written back to Settings.
+		const candidates = [
+			...new Set(
+				[
+					(this.settings.bridgeToken || '').trim(),
+					this.getPairedToken(),
+				].filter(Boolean),
+			),
+		];
+		for (const token of candidates.length ? candidates : ['']) {
+			try {
+				await this.client.open(url, token);
+				this.updateStatus({ bridgeConnected: true });
+				if (token && token !== (this.settings.bridgeToken || '').trim()) {
+					this.settings.bridgeToken = token;
+					this.onTokenAccepted?.(token);
+				}
+				return;
+			} catch (error) {
+				if (error instanceof BridgeRequestError && error.code === 'BAD_TOKEN') {
+					continue;
+				}
+				throw error;
 			}
-			throw error;
 		}
-		this.updateStatus({ bridgeConnected: true });
+		throw new BridgeRequestError(
+			'BAD_TOKEN',
+			t(
+				'The bridge rejected the token. Open TeXlyre with the Start TeXlyre launcher (it passes the token automatically), or paste the token shown in the bridge window into Settings → Backup → SFTP.',
+			),
+		);
+	}
+
+	getPairedToken(): string {
+		try {
+			return (localStorage.getItem(PAIRED_TOKEN_KEY) || '').trim();
+		} catch {
+			return '';
+		}
+	}
+
+	// Lets the modal save a token that worked into Settings.
+	setTokenAcceptedHandler(handler: ((token: string) => void) | null): void {
+		this.onTokenAccepted = handler;
 	}
 
 	private async connectHost(
@@ -655,6 +1088,7 @@ class SftpBackupService {
 	private async collectFiles(project: any): Promise<{
 		entries: { path: string; bytes: Uint8Array<ArrayBuffer>; sha256: string }[];
 		skipped: string[];
+		tooLarge: string[];
 	}> {
 		// Linked documents reach the file store on a 2 s debounce.
 		await documentFileSyncService.flushAll();
@@ -667,6 +1101,7 @@ class SftpBackupService {
 			{ path: string; bytes: Uint8Array<ArrayBuffer>; lastModified: number }
 		>();
 		const skipped: string[] = [];
+		const tooLarge: string[] = [];
 
 		for (const file of files) {
 			if (file.type !== 'file') continue;
@@ -681,13 +1116,18 @@ class SftpBackupService {
 					: new Uint8Array(content);
 			if (bytes.byteLength > maxBytes) {
 				skipped.push(file.path);
-				this.addActivity({
-					type: 'backup_error',
-					message: t('Skipped file {path}: exceeds max size of {size}MB', {
-						path: file.path,
-						size: Math.round(maxBytes / 1024 / 1024),
-					}),
-				});
+				tooLarge.push(file.path);
+				// Once per file per session: background sync runs every minute.
+				if (!this.reportedTooLarge.has(file.path)) {
+					this.reportedTooLarge.add(file.path);
+					this.addActivity({
+						type: 'backup_error',
+						message: t('Skipped file {path}: exceeds max size of {size}MB', {
+							path: file.path,
+							size: Math.round(maxBytes / 1024 / 1024),
+						}),
+					});
+				}
 				continue;
 			}
 
@@ -711,12 +1151,78 @@ class SftpBackupService {
 				sha256: await sha256Hex(bytes),
 			})),
 		);
-		return { entries, skipped };
+		return { entries, skipped, tooLarge };
+	}
+
+	private emitSummary(summary: SftpSummary): void {
+		this.lastSummary = summary;
+		for (const l of this.summaryListeners) l(summary);
+	}
+
+	private reportSyncSummary(summary: SftpSummary, host: string): void {
+		this.emitSummary(summary);
+		this.addActivity({
+			type: 'backup_complete',
+			message: t(
+				'Synced with {host}:{dir}: {down} in, {up} out, {delLocal} removed here, {delRemote} removed on server ({ms} ms)',
+				{
+					host,
+					dir: summary.remoteDir,
+					down: summary.downloaded,
+					up: summary.uploaded,
+					delLocal: summary.deletedLocal,
+					delRemote: summary.deletedRemote,
+					ms: summary.ms,
+				},
+			),
+		});
+		if (summary.serverWins.length > 0) {
+			this.addActivity({
+				type: 'import_start',
+				message: t(
+					'Changed on both sides, kept the server version: {paths}. Your versions are in {dir}',
+					{
+						paths: summary.serverWins
+							.slice(0, 5)
+							.map((w) => w.path)
+							.join(', '),
+						dir:
+							summary.backups[0]?.replace(/\/[^/]*$/, '') ||
+							'.texlyre/sftp-conflicts',
+					},
+				),
+			});
+		}
+		if (summary.skipped.length > 0) {
+			this.addActivity({
+				type: 'import_start',
+				message: t(
+					'Left for the next sync (edited while syncing or too large): {paths}',
+					{
+						paths: summary.skipped.slice(0, 5).join(', '),
+					},
+				),
+			});
+		}
 	}
 
 	private reportSummary(summary: SftpPushSummary, host: string): void {
-		this.lastSummary = summary;
-		for (const l of this.summaryListeners) l(summary);
+		this.emitSummary({
+			kind: 'push',
+			remoteDir: summary.remoteDir,
+			uploaded: summary.uploaded,
+			downloaded: 0,
+			deletedLocal: 0,
+			deletedRemote: summary.deleted,
+			unchanged: summary.unchanged,
+			adopted: summary.adopted,
+			serverWins: [],
+			backups: [],
+			skipped: summary.skipped,
+			conflicts: summary.conflicts,
+			remoteEdited: summary.remoteEdited,
+			ms: summary.ms,
+		});
 
 		this.addActivity({
 			type: 'backup_complete',
@@ -888,3 +1394,4 @@ class SftpBackupService {
 }
 
 export const sftpBackupService = new SftpBackupService();
+sftpBackupService.startAutoSync();

@@ -7,8 +7,8 @@ import {
 	DisconnectIcon,
 	FolderIcon,
 	GitPushIcon,
-	ImportIcon,
 	SettingsIcon,
+	SyncIcon,
 	TrashIcon,
 } from '@/components/common/Icons';
 import Modal from '@/components/common/Modal';
@@ -21,7 +21,8 @@ import { SftpIcon } from './Icon';
 import { SFTP_DEFAULT_BRIDGE_URL } from './settings';
 import {
 	type SftpDirListing,
-	type SftpPushSummary,
+	type SftpSummary,
+	type SftpSyncPreview,
 	type SftpTarget,
 	sftpBackupService,
 } from './SftpBackupService';
@@ -54,7 +55,7 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 	const [activities, setActivities] = useState(
 		sftpBackupService.getActivities(),
 	);
-	const [summary, setSummary] = useState<SftpPushSummary | null>(
+	const [summary, setSummary] = useState<SftpSummary | null>(
 		sftpBackupService.getLastSummary(),
 	);
 	const [isOperating, setIsOperating] = useState(false);
@@ -74,7 +75,7 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 
 	const { getProjectById } = useAuth();
 	const records = useRecords();
-	const { getSetting } = useSettings();
+	const { getSetting, updateSetting } = useSettings();
 
 	const projectId = isInEditor ? (currentProjectId ?? undefined) : undefined;
 
@@ -102,6 +103,11 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 			activityHistoryLimit:
 				(getSetting('sftp-backup-activity-history-limit')?.value as number) ||
 				50,
+			autoSync:
+				(getSetting('sftp-backup-auto-sync')?.value as boolean | undefined) ??
+				true,
+			autoSyncSeconds:
+				(getSetting('sftp-backup-auto-sync-interval')?.value as number) || 60,
 		});
 	}, [getSetting]);
 
@@ -124,6 +130,15 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 			unsubscribeSummary();
 		};
 	}, []);
+
+	// A token that worked (e.g. passed in by the launcher) replaces a stale
+	// one in Settings.
+	useEffect(() => {
+		sftpBackupService.setTokenAcceptedHandler((token) =>
+			updateSetting('sftp-backup-bridge-token', token),
+		);
+		return () => sftpBackupService.setTokenAcceptedHandler(null);
+	}, [updateSetting]);
 
 	// Passphrase / MFA prompts from the bridge are answered in this modal.
 	useEffect(() => {
@@ -220,17 +235,28 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 				{ host, remoteDir },
 				projectId,
 			);
-			if (ok) setShowConnectionFlow(false);
-			else setError(sftpBackupService.getStatus().error || null);
+			if (!ok) {
+				setError(sftpBackupService.getStatus().error || null);
+				return;
+			}
+			setShowConnectionFlow(false);
+			await runSync();
 		});
 
 	const handlePickRecent = (target: SftpTarget) =>
 		handleAsyncOperation(async () => {
 			setHostInput(target.host);
 			setRemoteDirInput(target.remoteDir);
-			const ok = await sftpBackupService.connect(target, projectId);
-			if (ok) setShowConnectionFlow(false);
-			else setError(sftpBackupService.getStatus().error || null);
+			const ok = await sftpBackupService.connect(
+				{ host: target.host, remoteDir: target.remoteDir },
+				projectId,
+			);
+			if (!ok) {
+				setError(sftpBackupService.getStatus().error || null);
+				return;
+			}
+			setShowConnectionFlow(false);
+			await runSync();
 		});
 
 	const handlePush = (force: boolean) =>
@@ -250,32 +276,36 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 			if (next.status === 'error') setError(next.error || null);
 		});
 
-	const handleImport = () =>
-		handleAsyncOperation(async () => {
-			const listing = await sftpBackupService.previewImport(projectId);
-			const excluded = listing.skipped.excluded;
-			if (
-				!window.confirm(
-					t(
-						'Import {count} files ({size} MB) from {host}:{dir} into this project?\n\nExcluded: {excluded}\n\nSame-named files already in the project will ask before being replaced. Afterwards TeXlyre records the server state; nothing is uploaded unless this project has files that are not on the server.',
-						{
-							count: listing.files.length,
-							size: (listing.totalBytes / 1024 / 1024).toFixed(1),
-							host: status.host,
-							dir: listing.remoteDir,
-							excluded: excluded.length
-								? `${excluded.slice(0, 8).join(', ')}${excluded.length > 8 ? ', ...' : ''}`
-								: t('nothing'),
-						},
-					),
-				)
-			) {
-				return;
-			}
-			await sftpBackupService.importFromRemote(projectId, listing);
-			const next = sftpBackupService.getStatus();
-			if (next.status === 'error') setError(next.error || null);
-		});
+	const confirmSync = async (p: SftpSyncPreview): Promise<boolean> => {
+		const lines = [
+			t('Sync with {host}:{dir}?', { host: p.host, dir: p.remoteDir }),
+			'',
+			t('{count} files come from the server', { count: p.download }),
+			t('{count} files go to the server', { count: p.upload }),
+			t('{count} files are removed from TeXlyre', { count: p.deleteLocal }),
+			t('{count} files are removed on the server', { count: p.deleteRemote }),
+		];
+		if (p.serverWins.length > 0) {
+			lines.push(
+				'',
+				t(
+					'Changed on both sides, the server version replaces yours in: {paths}. Your versions are saved in .texlyre/sftp-conflicts/.',
+					{
+						paths: `${p.serverWins.slice(0, 8).join(', ')}${p.serverWins.length > 8 ? ', ...' : ''}`,
+					},
+				),
+			);
+		}
+		return window.confirm(lines.join('\n'));
+	};
+
+	const runSync = async () => {
+		await sftpBackupService.sync(projectId, { confirm: confirmSync });
+		const next = sftpBackupService.getStatus();
+		if (next.status === 'error') setError(next.error || null);
+	};
+
+	const handleSync = () => handleAsyncOperation(runSync);
 
 	const handleDisconnect = () =>
 		handleAsyncOperation(async () => {
@@ -342,30 +372,75 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 		);
 	};
 
+	const autoSyncText = (): string => {
+		if (getSetting('sftp-backup-auto-sync')?.value === false) {
+			return t('off (Settings → Backup → SFTP)');
+		}
+		if (!sftpBackupService.getStoredTarget(projectId)?.autoSync) {
+			return t('starts after your first "Sync now" for this project');
+		}
+		if (status.autoSync === 'waiting-login') {
+			return t('paused until you log in: click "Sync now"');
+		}
+		if (status.autoSync === 'waiting-confirm') {
+			return t(
+				'paused: many files would be deleted, click "Sync now" to review',
+			);
+		}
+		return t('on, every {seconds} s while this project is open', {
+			seconds: Math.max(
+				15,
+				(getSetting('sftp-backup-auto-sync-interval')?.value as number) || 60,
+			),
+		});
+	};
+
 	const renderSummary = () => {
 		if (!summary) return null;
 		return (
 			<div className='sftp-summary'>
 				<div className='sftp-summary-counts'>
+					{summary.kind === 'sync' && (
+						<span>
+							<strong>{summary.downloaded}</strong> {t('from server')}
+						</span>
+					)}
 					<span>
-						<strong>{summary.uploaded}</strong> {t('uploaded')}
+						<strong>{summary.uploaded}</strong> {t('to server')}
+					</span>
+					{summary.kind === 'sync' && (
+						<span>
+							<strong>{summary.deletedLocal}</strong> {t('removed here')}
+						</span>
+					)}
+					<span>
+						<strong>{summary.deletedRemote}</strong> {t('removed on server')}
 					</span>
 					<span>
 						<strong>{summary.unchanged}</strong> {t('unchanged')}
 					</span>
-					<span>
-						<strong>{summary.deleted}</strong> {t('deleted')}
-					</span>
-					{summary.adopted > 0 && (
+					{summary.kind === 'push' && (
 						<span>
-							<strong>{summary.adopted}</strong> {t('adopted')}
+							<strong>{summary.conflicts.length}</strong> {t('conflicts')}
 						</span>
 					)}
-					<span>
-						<strong>{summary.conflicts.length}</strong> {t('conflicts')}
-					</span>
 					<span className='sftp-summary-time'>{summary.ms} ms</span>
 				</div>
+				{summary.serverWins.length > 0 && (
+					<div className='sftp-remote-edited'>
+						{t('Changed on both sides, kept the server version:')}{' '}
+						{summary.serverWins.map((w) => (
+							<code key={w.path}>{w.path}</code>
+						))}
+						<div className='sftp-hint'>
+							{t('Your versions are saved in {dir}', {
+								dir:
+									summary.backups[0]?.replace(/\/[^/]*$/, '') ||
+									'.texlyre/sftp-conflicts',
+							})}
+						</div>
+					</div>
+				)}
 				{summary.conflicts.length > 0 && (
 					<ul className='sftp-conflicts'>
 						{summary.conflicts.map((c) => (
@@ -601,28 +676,29 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 										<div className='backup-toolbar'>
 											<div className='primary-actions'>
 												<button
+													type='button'
 													className='button primary'
-													onClick={() => handlePush(false)}
+													onClick={handleSync}
 													disabled={isOperating || status.status === 'syncing'}
+													title={t(
+														'Bring in server changes and upload your TeXlyre edits',
+													)}
 												>
-													<GitPushIcon />
-													{isOperating ? t('Pushing...') : t('Push via SFTP')}
+													<SyncIcon />
+													{isOperating || status.status === 'syncing'
+														? t('Syncing...')
+														: t('Sync now')}
 												</button>
 												<button
-													className='button secondary'
-													onClick={handleImport}
-													disabled={isOperating || status.status === 'syncing'}
-													title={t('Copy the server folder into this project')}
-												>
-													<ImportIcon />
-													{t('Import from server')}
-												</button>
-												<button
+													type='button'
 													className='button warn secondary'
 													onClick={() => handlePush(true)}
 													disabled={isOperating || status.status === 'syncing'}
-													title={t('Overwrite conflicting files on the server')}
+													title={t(
+														'Upload the TeXlyre version everywhere, overwriting server edits',
+													)}
 												>
+													<GitPushIcon />
 													{t('Force push')}
 												</button>
 											</div>
@@ -676,6 +752,11 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 									<div className='status-item'>
 										<strong>{t('Last Sync:')}</strong>{' '}
 										{formatDate(status.lastSync)}
+									</div>
+								)}
+								{connected && (
+									<div className='status-item'>
+										<strong>{t('Auto-sync:')}</strong> {autoSyncText()}
 									</div>
 								)}
 							</div>
@@ -747,17 +828,17 @@ const SftpBackupModal: React.FC<SftpBackupModalProps> = ({
 								</li>
 								<li>
 									{t(
-										'Push mirrors the plain project tree (main.tex, figures/, ...) into the remote directory, uploading only files that changed.',
+										'Sync keeps this project and the server folder identical: server changes come in, your TeXlyre edits go out, only changed files are transferred.',
 									)}
 								</li>
 								<li>
 									{t(
-										'Files edited on the server, or not created by TeXlyre, are never overwritten unless you Force push. Build outputs next to the project are left alone.',
+										'When a file changed on both sides, the server version wins and your TeXlyre version is saved under .texlyre/sftp-conflicts/. Build outputs (build/, .aux, .log, ...) are never synced.',
 									)}
 								</li>
 								<li>
 									{t(
-										'Import from server copies an existing folder (e.g. a paper on your cluster) into this project once; later pushes only upload what you change.',
+										'After your first "Sync now", the project syncs in the background while it is open. It never asks for your login on its own and pauses before deleting more than 5 files. Force push instead makes the TeXlyre version win everywhere.',
 									)}
 								</li>
 							</ul>

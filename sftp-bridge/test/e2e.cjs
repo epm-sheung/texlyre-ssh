@@ -107,6 +107,66 @@ async function mapLimit(items, limit, fn) {
 	);
 }
 
+// What the plugin's two-way sync does: syncPlan -> get*/local deletes ->
+// put* -> commit. `local` (Map rel -> Buffer) is updated in place; the
+// overwritten or deleted local versions of server-wins files are returned.
+async function syncOnce(
+	client,
+	remoteDir,
+	local,
+	exclude,
+	{ skipDownload = [] } = {},
+) {
+	const manifest = [...local].map(([rel, buf]) => ({
+		path: `/${rel}`,
+		sha256: sha256(buf),
+	}));
+	const plan = await client.request('syncPlan', {
+		remoteDir,
+		manifest,
+		exclude,
+	});
+	const wins = new Map(plan.serverWins.map((w) => [w.path, w]));
+	const backups = new Map();
+	const downloaded = [];
+	for (const rel of [
+		...plan.download,
+		...plan.serverWins
+			.filter((w) => w.action === 'download')
+			.map((w) => w.path),
+	]) {
+		if (skipDownload.includes(rel)) continue;
+		const r = await client.request('get', { remoteDir, path: `/${rel}` });
+		if (wins.has(rel) && local.has(rel)) backups.set(rel, local.get(rel));
+		local.set(rel, Buffer.from(r.content, 'base64'));
+		downloaded.push({ path: `/${rel}`, sha256: r.sha256 });
+	}
+	const deletedLocal = [];
+	for (const rel of [
+		...plan.deleteLocal,
+		...plan.serverWins
+			.filter((w) => w.action === 'deleteLocal')
+			.map((w) => w.path),
+	]) {
+		if (wins.has(rel)) backups.set(rel, local.get(rel));
+		local.delete(rel);
+		deletedLocal.push(`/${rel}`);
+	}
+	for (const rel of plan.upload) {
+		await client.request('put', {
+			planId: plan.planId,
+			path: `/${rel}`,
+			content: local.get(rel).toString('base64'),
+		});
+	}
+	const result = await client.request('commit', {
+		planId: plan.planId,
+		downloaded,
+		deletedLocal,
+	});
+	return { plan, result, backups };
+}
+
 // What the TeXlyre plugin does: manifest -> plan -> put* -> commit.
 async function push(client, remoteDir, files, { force = false } = {}) {
 	const manifest = [...files].map(([rel, buf]) => ({
@@ -262,7 +322,14 @@ async function main() {
 		].join('\n\n'),
 	);
 
-	const wsPort = 17000 + Math.floor(Math.random() * 2000);
+	// Ask the OS for a free port (a random pick can collide and abort the run).
+	const wsPort = await new Promise((resolve) => {
+		const probe = require('node:net').createServer();
+		probe.listen(0, '127.0.0.1', () => {
+			const { port } = probe.address();
+			probe.close(() => resolve(port));
+		});
+	});
 	const bridge = spawn(
 		process.execPath,
 		[path.join(__dirname, '..', 'bridge.cjs')],
@@ -651,6 +718,161 @@ async function main() {
 			);
 		},
 	);
+	// ------------------------------------------- two-way sync (server wins)
+	{
+		const DIR = 'sync/demo';
+		const SX = ['build', '*.aux', '*.log'];
+		const at = (rel) =>
+			path.join(remoteHome, 'sync', 'demo', ...rel.split('/'));
+		const put = (rel, content) => {
+			fs.mkdirSync(path.dirname(at(rel)), { recursive: true });
+			fs.writeFileSync(at(rel), content);
+		};
+		const serverTree = () => {
+			const out = new Map();
+			const walk = (dir, prefix) => {
+				for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+					const rel = prefix ? `${prefix}/${e.name}` : e.name;
+					if (e.isDirectory()) {
+						if (e.name !== 'build') walk(path.join(dir, e.name), rel);
+					} else if (rel !== '.texlyre-sync.json' && !rel.endsWith('.aux')) {
+						out.set(rel, fs.readFileSync(path.join(dir, e.name)));
+					}
+				}
+			};
+			walk(path.join(remoteHome, 'sync', 'demo'), '');
+			return out;
+		};
+		// The promise of sync: afterwards local and server hold the same files.
+		const assertAligned = (local) => {
+			const srv = serverTree();
+			assert.deepEqual([...local.keys()].sort(), [...srv.keys()].sort());
+			for (const [rel, buf] of local)
+				assert.ok(buf.equals(srv.get(rel)), `content differs: ${rel}`);
+		};
+		put('main.tex', 'main v1\n');
+		put('refs.bib', '@a{a}\n');
+		put('chapter.tex', 'chapter v1\n');
+		put('figs/a.png', rand(4096));
+		put('build/out.pdf', 'pdf');
+		put('main.aux', 'aux');
+		const local = new Map();
+
+		await step(
+			'sync: first sync pulls the folder (excludes skipped)',
+			async () => {
+				const { plan } = await syncOnce(c, DIR, local, SX);
+				assert.deepEqual(plan.download, [
+					'chapter.tex',
+					'figs/a.png',
+					'main.tex',
+					'refs.bib',
+				]);
+				assertAligned(local);
+				const again = await syncOnce(c, DIR, local, SX);
+				assert.equal(
+					again.plan.download.length +
+						again.plan.upload.length +
+						again.plan.serverWins.length,
+					0,
+				);
+				return `downloaded ${plan.download.length}; second sync: nothing to do`;
+			},
+		);
+		await step('sync: TeXlyre edit uploads', async () => {
+			local.set('main.tex', Buffer.from('main v2 edited in TeXlyre\n'));
+			const { plan } = await syncOnce(c, DIR, local, SX);
+			assert.deepEqual(plan.upload, ['main.tex']);
+			assertAligned(local);
+		});
+		await step('sync: server edit downloads', async () => {
+			put('refs.bib', '@a{a}\n@b{b, edited on cluster}\n');
+			const { plan } = await syncOnce(c, DIR, local, SX);
+			assert.deepEqual(plan.download, ['refs.bib']);
+			assertAligned(local);
+		});
+		await step(
+			'sync: edited on both -> server wins, local copy kept',
+			async () => {
+				local.set('chapter.tex', Buffer.from('chapter v2 local edit\n'));
+				put('chapter.tex', 'chapter v2 server edit, longer\n');
+				const { plan, backups } = await syncOnce(c, DIR, local, SX);
+				assert.deepEqual(plan.serverWins, [
+					{
+						path: 'chapter.tex',
+						action: 'download',
+						reason: 'changed-on-both',
+					},
+				]);
+				assert.equal(
+					local.get('chapter.tex').toString(),
+					'chapter v2 server edit, longer\n',
+				);
+				assert.equal(
+					backups.get('chapter.tex').toString(),
+					'chapter v2 local edit\n',
+				);
+				assertAligned(local);
+			},
+		);
+		await step('sync: new files flow both ways', async () => {
+			local.set('sec/new-local.tex', Buffer.from('from TeXlyre\n'));
+			put('sec/new-server.tex', 'from cluster\n');
+			const { plan } = await syncOnce(c, DIR, local, SX);
+			assert.deepEqual(plan.upload, ['sec/new-local.tex']);
+			assert.deepEqual(plan.download, ['sec/new-server.tex']);
+			assertAligned(local);
+		});
+		await step('sync: deletions flow both ways', async () => {
+			fs.unlinkSync(at('figs/a.png')); // deleted on server
+			local.delete('refs.bib'); // deleted in TeXlyre
+			const { plan } = await syncOnce(c, DIR, local, SX);
+			assert.deepEqual(plan.deleteLocal, ['figs/a.png']);
+			assert.deepEqual(plan.deleteRemote, ['refs.bib']);
+			assert.ok(!fs.existsSync(at('refs.bib')));
+			assertAligned(local);
+		});
+		await step('sync: delete vs edit -> server wins', async () => {
+			local.set(
+				'chapter.tex',
+				Buffer.from('local edit of a file deleted on server\n'),
+			);
+			fs.unlinkSync(at('chapter.tex'));
+			local.delete('main.tex');
+			put('main.tex', 'main v3 edited on cluster, longer text\n');
+			const { plan, backups } = await syncOnce(c, DIR, local, SX);
+			assert.deepEqual(plan.serverWins, [
+				{
+					path: 'chapter.tex',
+					action: 'deleteLocal',
+					reason: 'deleted-on-server',
+				},
+				{ path: 'main.tex', action: 'download', reason: 'changed-on-server' },
+			]);
+			assert.ok(backups.has('chapter.tex'));
+			assertAligned(local);
+		});
+		await step('sync: excluded files are never touched', async () => {
+			local.set('build/local.pdf', Buffer.from('local build'));
+			const { plan } = await syncOnce(c, DIR, local, SX);
+			assert.ok(!plan.upload.includes('build/local.pdf'));
+			assert.equal(fs.readFileSync(at('build/out.pdf'), 'utf8'), 'pdf');
+			assert.equal(fs.readFileSync(at('main.aux'), 'utf8'), 'aux');
+			local.delete('build/local.pdf');
+		});
+		await step('sync: a skipped download is retried next time', async () => {
+			put('main.tex', 'main v4 cluster edit, even longer text here\n');
+			const first = await syncOnce(c, DIR, local, SX, {
+				skipDownload: ['main.tex'],
+			});
+			assert.deepEqual(first.result.notApplied, ['main.tex']);
+			const second = await syncOnce(c, DIR, local, SX);
+			assert.deepEqual(second.plan.download, ['main.tex']);
+			assertAligned(local);
+			return `notApplied=${first.result.notApplied}; retried and aligned`;
+		});
+	}
+
 	await step('folder browser (dirs)', async () => {
 		const home = await c.request('dirs', { remoteDir: '~' });
 		assert.equal(home.path, '/home/tester');
