@@ -1,0 +1,20 @@
+{
+  "name": "texlyre-sftp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local WebSocket <-> SSH/SFTP bridge for the TeXlyre SFTP backup plugin (Chelys-recipe shaped)",
+  "main": "bridge.cjs",
+  "license": "AGPL-3.0",
+  "scripts": {
+    "start": "node bridge.cjs",
+    "test": "node test/e2e.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ssh-config": "^5.3.0",
+    "ssh2": "^1.17.0",
+    "ws": "^8.21.3"
+  }
+}

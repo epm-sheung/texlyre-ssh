@@ -1,0 +1,118 @@
+/* extras/backup/sftp/styles.css */
+.sftp-auth-prompt {
+	border-color: var(--pico-primary, #007bff);
+}
+
+.sftp-prompt-instructions {
+	margin: 0 0 1rem 0;
+	white-space: pre-wrap;
+	font-size: 0.85rem;
+	background: transparent;
+	padding: 0;
+}
+
+.sftp-hint {
+	margin: -0.5rem 0 1rem 0;
+	font-size: 0.85rem;
+	opacity: 0.75;
+}
+
+.sftp-recent {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.5rem;
+	margin-bottom: 1rem;
+}
+
+.sftp-path-row {
+	display: flex;
+	gap: 0.5rem;
+	align-items: flex-start;
+}
+
+.sftp-path-row input {
+	flex: 1;
+}
+
+.sftp-browser {
+	max-height: 14rem;
+	overflow-y: auto;
+	margin-bottom: 1rem;
+	border: 1px solid var(--accent-border);
+	border-radius: 4px;
+}
+
+.sftp-dir-item {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	width: 100%;
+	padding: 0.35rem 0.75rem;
+	border: none;
+	background: transparent;
+	color: var(--text-color);
+	text-align: left;
+	cursor: pointer;
+}
+
+.sftp-dir-item:hover:not(:disabled) {
+	background-color: var(--accent-background);
+}
+
+.sftp-browser-empty {
+	padding: 0.5rem 0.75rem;
+	opacity: 0.7;
+}
+
+.sftp-link {
+	border: none;
+	background: none;
+	padding: 0;
+	color: var(--pico-primary, #007bff);
+	cursor: pointer;
+	text-decoration: underline;
+}
+
+.sftp-no-project {
+	padding: 1rem;
+	border: 1px dashed var(--accent-border);
+	border-radius: 8px;
+	margin-bottom: 1rem;
+}
+
+.sftp-summary {
+	margin-top: 1rem;
+	padding: 0.75rem 1rem;
+	border: 1px solid var(--accent-border);
+	border-radius: 8px;
+	background-color: var(--accent-background);
+	font-size: 0.9rem;
+}
+
+.sftp-summary-counts {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 1rem;
+}
+
+.sftp-summary-time {
+	margin-left: auto;
+	opacity: 0.7;
+}
+
+.sftp-conflicts {
+	margin: 0.75rem 0 0 0;
+	padding-left: 1.25rem;
+}
+
+.sftp-conflicts li span {
+	opacity: 0.75;
+}
+
+.sftp-remote-edited {
+	margin-top: 0.5rem;
+}
+
+.sftp-remote-edited code {
+	margin-right: 0.35rem;
+}

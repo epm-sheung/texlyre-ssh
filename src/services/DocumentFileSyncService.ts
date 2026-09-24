@@ -12,7 +12,7 @@ const SYNC_MAX_WAIT = 10000;
 
 interface DocumentWatcher {
 	yText: Y.Text;
-	sync: { (): void; flush: () => void };
+	sync: { (): void; flush: () => Promise<void> | undefined };
 	fileId?: string;
 }
 
@@ -30,13 +30,19 @@ class DocumentFileSyncService {
 
 		const yText = doc.getText('codemirror');
 		const sync = debounce(
-			() => void this.syncToLinkedFile(key, documentId),
+			() => this.syncToLinkedFile(key, documentId),
 			SYNC_DELAY,
 			{ maxWait: SYNC_MAX_WAIT },
 		);
 
 		yText.observe(sync);
 		this.watchers.set(key, { yText, sync });
+	}
+
+	// Write pending document edits to their linked files now, e.g. before a
+	// backup reads file contents.
+	async flushAll(): Promise<void> {
+		await Promise.all([...this.watchers.values()].map((w) => w.sync.flush()));
 	}
 
 	unwatch(projectId: string, documentId: string): void {

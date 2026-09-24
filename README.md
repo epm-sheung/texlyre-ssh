@@ -1,297 +1,35 @@
-# TeXlyre
+# TeXlyre + SSH
 
-A **[local-first](https://www.inkandswitch.com/essay/local-first/)** real-time [LaTeX](https://www.latex-project.org/) and [Typst](https://typst.app) collaboration platform with offline editing capabilities. Built with React, TypeScript, and Yjs for collaborative document editing.
+A fork of **[TeXlyre](https://github.com/TeXlyre/texlyre)**, the local-first LaTeX & Typst editor, that adds **SSH/SFTP support**: open a paper that lives on any SSH server (a cluster, a lab machine, a VPS), edit and compile it in the browser, and push your changes back.
 
-[![TeXlyre](https://img.shields.io/website?url=https%3A%2F%2Ftexlyre.org%2Ftexlyre%2F&label=TeXlyre&up_message=%F0%9F%9F%A2%20online&down_message=%F0%9F%94%B4%20offline&up_color=555&down_color=555)](https://texlyre.github.io/texlyre/)
-[![Uptime](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FTeXlyre%2Fupptime%2FHEAD%2Fapi%2Ftexlyre-app%2Fuptime.json)](https://texlyre.github.io/upptime/)
+## What's new
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/texlyre/texlyre/test.yml?label=tests)](https://github.com/texlyre/texlyre/actions)
-[![Crowdin](https://badges.crowdin.net/texlyre/localized.svg)](https://crowdin.com/project/texlyre)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![TypeScript](https://img.shields.io/badge/%3C%2F%3E-TypeScript-%230074c1.svg)](https://www.typescriptlang.org/)
-[![React](https://img.shields.io/badge/React-19+-61DAFB.svg)](https://react.dev/)
+- **Import from server**: copy a folder from any SSH host into a TeXlyre project.
+- **Push via SFTP**: upload only the files you changed.
+- **Safe by default**: files edited on the server are never overwritten (unless you Force push), and nothing TeXlyre didn't create is ever deleted, so build outputs next to your paper are left alone.
+- **Works like `ssh`**: uses your `~/.ssh/config`, keys, `known_hosts`, ProxyJump/ProxyCommand, key passphrases, and MFA/Duo prompts. You can also type `user@host[:port]` directly.
+- **One login per session**: MFA is asked once; the connection is reused until it's idle for 30 minutes.
 
-![Main editor interface showing split view with LaTeX code on left, compiled PDF on right](showcase/main_showcase_dark.png)
+Browsers can't open SSH connections, so a small local helper, [`sftp-bridge/`](sftp-bridge/README.md), holds the connection on your machine. Your keys never leave `~/.ssh`.
 
-## Features
+## Quick start
 
-### Real-time Collaboration
-
-TeXlyre enables multi-user editing with live cursors and selections visible across all connected clients. The platform uses **[Yjs](https://github.com/yjs/yjs) CRDTs** for conflict-free synchronization, ensuring that changes from multiple users are automatically merged without conflicts. Communication happens through **WebRTC** peer-to-peer connections, providing low-latency collaboration without requiring a central server. An integrated chat system allows collaborators to communicate directly within the editing environment.
-
-<p align="center">
-<img src="showcase/collab_cursor_zoomed.png" alt="Multiple users editing simultaneously with different colored cursors" >
-</p>
-
-TeXlyre provides comment and chat features for real-time exchanges, reviews, and discussions among collaborators.
-
-<p align="center">
-<img src="showcase/chat_zoomed.png" alt="Collaborators using the chat panel to discuss progress">
-</p>
-
-TeXlyre also includes embedded diagram editors including [Draw.io](https://www.drawio.com/) and [TikZ Editor](https://tikz.dev), enabling collaborators to create and edit diagrams in real-time directly within a project.
-
-<p align="center">
-<img src="showcase/collab_cursor_drawio.png" alt="Collaborators editing a draw.io diagram simultaneously within a TeXlyre project">
-</p>
-
-### Comments and Review
-
-TeXlyre supports inline **comments** and **tracked changes** for collaborative review. Comments can be discussed and resolved, while tracked insertions and deletions appear in the review panel where they can be accepted, rejected, or discussed.
-
-<p align="center">
-<img src="showcase/review_comment_panel.png" alt="TeXlyre editor with tracked edits and the review panel open">
-</p>
-
-### LaTeX Compilation
-
-The platform integrates **[SwiftLaTeX](https://github.com/SwiftLaTeX/SwiftLaTeX (TeX Live 2020)) and [BusyTeX (TeX Live 2026)](https://github.com/busytex/busytex) WASM engines** to provide in-browser LaTeX compilation without server dependencies. Currently supports **pdfTeX**, **XeTeX**, and **LuaTeX** engines for document processing. TeXlyre supports real-time syntax highlighting and error detection, with an integrated PDF viewer that offers zoom, navigation, and side-by-side editing capabilities.
-
-<p align="center">
-<img src="showcase/error_parser_zoomed_latex.png" alt="LaTeX compilation in progress with error panel and PDF output" width="600">
-</p>
-
-**[SyncTeX](https://github.com/jlaurens/synctex)** (source mapping between the LaTeX source and the compiled PDF) is supported **only with BusyTeX engines**. Clicking the SyncTeX button in the PDF viewer highlights the corresponding region in the output, making it easier to locate where a given source line is rendered. Reverse SyncTeX is also supported, allowing you to jump from a location in the compiled PDF back to the matching line in the source.
-
-<p align="center">
-  <img src="showcase/synctex_highlight_zoomed.svg"
-       alt="SyncTeX highlighting the header in the compiled PDF after clicking the SyncTeX button">
-</p>
-
-### Typst Compilation
-
-The platform integrates **[typst.ts](https://github.com/Myriad-Dreamin/typst.ts)** to provide in-browser [Typst](https://github.com/typst/typst) compilation without server dependencies. Currently supports PDF, SVG, and canvas compilation, however, SVG and HTML compilation are experimental, and are not guaranteed to work as expected at the time being.  
-
-<p align="center">
-<img src="showcase/error_parser_zoomed_typst.png" alt="Typst compilation in progress" width="600">
-</p>
-
-### File Management and Synchronization
-
-The platform includes a file explorer supporting drag-and-drop operations for various file types including LaTeX sources, Typst sources, images, and data files. **Document linking** creates connections between collaborative documents and static files, enabling seamless editing workflows. **[FilePizza](https://github.com/kern/filepizza) integration** provides secure peer-to-peer file sharing between collaborators, allowing large file transfers without intermediary servers.
-
-![Project dashboard with file explorer and project cards](showcase/project_viewer_zoomed.png)
-
-### Editor Tools
-
-TeXlyre includes editor-level tools designed to improve mathematical authoring and document quality. These tools operate entirely in the browser, work offline, and remain synchronized across collaborators in real time.
-
-TeXlyre provides built-in document statistics to help authors track progress while writing. Word counts are computed using **[TeXcount](https://app.uio.no/ifi/texcount/)** for LaTeX documents and **[typst-wordometer](https://github.com/Jollywatt/typst-wordometer)** for Typst documents, delivering accurate statistics that reflect the structure of each language rather than raw text length.
-
-<p align="center">
-  <img src="showcase/statistics_modal.svg"
-       alt="Statistics modal showing word counts, with arrow pointing to the statistics button">
-</p>
-
-To maintain clean and readable source files, TeXlyre includes formatting tools for both LaTeX and Typst. LaTeX documents are formatted using **[tex-fmt](https://github.com/WGUNDERWOOD/tex-fmt)**, while Typst documents use **[typstyle](https://github.com/typstyle-rs/typstyle)**, applying consistent indentation and line separation without altering document semantics.
-
-<p align="center">
-  <img src="showcase/format_latex_before_after.svg"
-       alt="Source code before and after formatting, with arrow pointing to the formatting button">
-</p>
-
-Mathematical expressions can be edited interactively using inline previews powered by **[MathLive](https://github.com/arnog/mathlive)**. When hovering over or placing the cursor inside a math expression, TeXlyre renders the formula directly and allows it to be edited using the MathLive virtual keyboard, making equations easier to create and modify.
-
-<p align="center">
-  <img src="showcase/mathlive_hover_edit_before_after.svg"
-       alt="Inline math preview on hover, with arrow pointing to the edit button that opens the MathLive editor">
-</p>
-
-### Language Server Protocol (LSP)
-
-TeXlyre offers limited LSP support over WebSocket. The CodeMirror editor acts as a client for LSP servers deployed locally. As an example, TeXlyre integrates with a locally-run `ltex-ls-plus` grammar and spell checker (see the [LTeX LS Plus recipe](https://texlyre.github.io/docs/supported-lsp/ltx-ls-plus) for instructions on how to deploy and integrate the server with TeXlyre).
-
-<p align="center">
-  <img src="showcase/harper_ls_zoomed.png"
-       alt="TeXlyre LSP client receiving grammar and spell-checking actions over WebSocket from the Harper LS server">
-</p>
-
-### External LSP and Typesetters
-
-TeXlyre can connect to external language servers and typesetters running outside the browser. These tools can be deployed alongside a self-hosted instance using [Chelys recipes](https://github.com/TeXlyre/texlyre-infrastructure#chelys-recipes), or managed locally through [Chelys](https://github.com/TeXlyre/chelys#local-tooling), the TeXlyre desktop companion.
-
-The infrastructure recipes support language servers such as **[LTeX LS Plus](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/lsp/ltex-ls-plus)**, **[Harper LS](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/lsp/harper-ls)**, **[TexLab](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/lsp/texlab)**, **[Tinymist](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/lsp/tinymist-lsp)**, and **[JabRef LSP](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/lsp/jabref-ls)**, as well as external typesetters including **[SILE](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/sile)**, **[ConTeXt LMTX](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/context)**, **[PreTeXt](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/pretext)**, **[TeX Live](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/texlive)**, **[Tinymist](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/tinymist)**, **[Asciidoctor](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/asciidoctor)**, **[Quarto](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/quarto)**, **[LilyPond](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/lilypond)**, **[Slidev](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/slidev)**, and **[Sphinx](https://github.com/TeXlyre/chelys-recipes/tree/main/recipes/typesetter/sphinx)**. Chelys provides local language-server and typesetter setup through its recipe UI.
-
-
-## Quick Start
-
-
-For detailed installation instructions, advanced configuration, and development workflows, see the [installation documentation](https://texlyre.org/docs/installation). 
-
-For configuring TeXlyre's theme, properties, and supported plugins, see the [configuration documentation](https://texlyre.org/docs/configuration#configuration-files). 
-
-Installation requires Node.js 20+ and a modern browser with File System Access API support:
+Requires Node.js 20+.
 
 ```bash
-git clone https://github.com/TeXlyre/texlyre.git
-cd texlyre
 npm install
-npm run start
+npm run dev                              # TeXlyre at http://localhost:5173/texlyre/
+cd sftp-bridge && npm install && node bridge.cjs   # prints a token (saved; paste once)
 ```
 
-Navigate to `http://localhost:4173` to access the application. Create a new project to begin editing, or open an existing project by sharing its URL with collaborators. The URL format `http://localhost:4173/#yjs:abc123def456` enables instant collaboration access.
+1. In TeXlyre, sign up (local account), then paste the token under **Settings → Backup → SFTP**.
+2. Open a project, click **Backup ▾ → SFTP → Connect over SFTP**, pick a host, then browse to the folder.
+3. **Import from server** to bring the files in; **Push via SFTP** to send changes back.
 
-Moreover, you can start your project from a template and share the link with your collaborators.
+## Everything else
 
-<p align="center">
-<img src="showcase/templates_zoomed.png" alt="Getting started with a template">
-</p>
-
-## Architecture
-
-TeXlyre's architecture emphasizes **local-first principles** while enabling real-time collaboration. The React frontend communicates with Yjs documents stored in IndexedDB, providing offline-first functionality. WebRTC establishes direct peer connections for real-time synchronization, while **[SwiftLaTeX](https://github.com/SwiftLaTeX/SwiftLaTeX),[texlyre-busytex](https://github.com/TeXlyre/texlyre-busytex)** and **[typst.ts](https://github.com/Myriad-Dreamin/typst.ts)** handle LaTeX and Typst compilation entirely in the browser.
-
-The **plugin system** allows extensibility through custom viewers, renderers, and backup providers. Core plugins handle PDF rendering, Bibliography cleaning, LaTeX and Typst log visualization, embedded **[Milkdown](https://milkdown.dev/)** markdown editor, **[TikZ](https://tikz.dev)** and **[Draw.io](https://drawio.com)** diagram editors with collaborative support, **[Zotero](https://www.zotero.org/)** and **[OpenAlex](https://www.openalex.org/)** reference search, import, and update panel, file system backups, and repository backups to/from GitHub, GitLab, Gitea, and Codeberg (Forgejo). Theme plugins also provide customizable layouts and visual styles.
-
-<p align="center">
-  <img src="showcase/zotero_bib_panel.png"
-       alt="Bib Editor plugin integrated into the TeXlyre app along with Zotero integration panel">
-</p>
-
-
-## File Synchronization
-
-### Local File System
-
-The File System Access API enables direct synchronization with local folders, supporting cross-device workflows through cloud storage providers like Dropbox or Google Drive. Users can connect TeXlyre projects to existing file system structures, maintaining compatibility with traditional LaTeX and Typst workflows.
-
-### Peer-to-peer Sharing
-
-**[FilePizza](https://github.com/kern/filepizza) integration** facilitates secure file sharing between collaborators over WebRTC. Large files, images, and other non-collaborative text files can be transferred directly between browsers, maintaining privacy and reducing dependency on external services. This protocol, although completely independent of the Yjs WebRTC connection, still uses Yjs to manage file metadata and synchronization state, ensuring that all collaborators have access to the latest versions of shared files. Yjs facilitates real-time collaboration (e.g., live updates to file lists, shared metadata, cursor tracking, real-time document editing) while FilePizza handles the file transfer of non-collaborative files.
-
-## Plugin Development
-
-The plugin architecture supports custom functionality through typed interfaces:
-
-```typescript
-interface ViewerPlugin extends Plugin {
-  type: 'viewer';
-  canHandle: (fileType: string, mimeType?: string) => boolean;
-  renderViewer: React.ComponentType<ViewerProps>;
-}
-```
-
-Plugins can extend TeXlyre with custom file viewers, LaTeX/Typst log processors, backup providers, and theme variations (including a mobile theme). The plugin registry automatically discovers and loads compatible plugins during application initialization.
-
-Once a plugin is developed, it can be registered in the `plugins.config.ts` by simply adding its path (excluding the '/extras' prefix). All plugins must be placed in the 'extras' directory to be recognized by the system. 
-
-Configuration may be overriden by the `texlyre.config.ts` depending on your installation. **ALWAYS** set the plugin path as well in `texlyre.config.ts` for guaranteed persistence of the config (see the [configuration documentation](https://texlyre.org/docs/configuration#configuration-files))
-
-## Browser Compatibility
-
-TeXlyre requires modern browser features for optimal functionality.
-
-* **Chrome and Edge** provide full feature support, including the File System Access API and WebRTC.
-* **Firefox** supports core collaboration features but has limited file system integration.
-* **Safari** offers partial compatibility with reduced file system access capabilities.
-
-The File System API was not thoroughly tested with mobile device browsers; therefore, use the file system backup feature on TeXlyre with caution.
-
-WebRTC support is required for real-time collaboration, while the File System Access API enables backup and synchronization features in supported browsers.
-
-## PWA Support
-
-TeXlyre can be installed as a Progressive Web App (PWA), allowing it to run like a native app on supported devices. After installing the PWA (for example, on Android phones), you can share files directly to TeXlyre to open them, including regular files, ZIP archives, and TeXlyre project ZIP files.
-
-PWA support on iOS may have platform-specific limitations compared to desktop or Android browsers, including reduced file-sharing capabilities.
-
----
-
-## Privacy & Data
-
-TeXlyre is privacy-focused by design:
-
-- **Local-first**: All your data stays in your browser
-- **Direct connections**: Peer-to-peer collaboration without server intermediaries  
-- **No tracking**: No analytics, cookies, or data collection
-
-When you collaborate, IP addresses are temporarily processed through signaling servers to establish direct connections. No project content is transmitted through our servers.
-
-### Repository Backup Integration
-The optional GitHub, GitLab, Gitea, and Forgejo (Codeberg) integration only activates when you explicitly enable them and provide your own token.
-
-## Infrastructure & Self-Hosting
-
-TeXlyre uses open source signaling servers for WebRTC connections:
-
-- **[Y-WebRTC Signaling](https://github.com/TeXlyre/y-webrtc-server)**: Based on [y-webrtc](https://github.com/yjs/y-webrtc)
-- **[PeerJS Signaling](https://github.com/TeXlyre/peerjs-server)**: Based on [PeerJS Server](https://github.com/peers/peerjs-server)
-- **[FilePizza Server](https://github.com/TeXlyre/filepizza-server)**: Based on [FilePizza](https://github.com/kern/filepizza) which relies on PeerJS (built-in TURN containers are not deployed on TeXlyre servers)
-- **[TeX Live 2020 Download Server](https://github.com/TeXlyre/texlive-ondemand-server)**: Based on [SwiftLaTeX Texlive On-Demand Server](https://github.com/SwiftLaTeX/Texlive-Ondemand)
-- **[TeX Live 2026 Download Server](https://github.com/TeXlyre/texlyre-busytex-build/tree/main/texlive-server)**: Custom server for providing TeX Live packages
-- **[Git Repository Proxy Server](https://github.com/TeXlyre/repository-proxy-server)**: Custom server for downloading repositories from GitHub, GitLab, and Codeberg
-
-All servers are hosted locally and made publicly available with [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
-
-You can run your own signaling servers by following the setup instructions in our [infrastructure repository](https://github.com/texlyre/texlyre-infrastructure).
-
-## Acknowledgments
-
-TeXlyre builds upon several key technologies:
-
-### Core Technologies
-- **[SwiftLaTeX](https://github.com/SwiftLaTeX/SwiftLaTeX)** - WASM-based LaTeX compilation engine
-- **[BusyTeX](https://github.com/busytex/busytex)** - WASM-based LaTeX compilation engine
-- **[typst.ts](https://github.com/Myriad-Dreamin/typst.ts)** - WASM-based Typst compilation engine
-- **[Yjs](https://github.com/yjs/yjs)** - Conflict-free collaborative editing with CRDTs
-- **[CodeMirror](https://codemirror.net/)** - Extensible code editor
-- **[PDF.js](https://github.com/mozilla/pdf.js)** - PDF rendering in JavaScript
-- **[FilePizza](https://github.com/kern/filepizza)** - Secure peer-to-peer file transfers
-
-### Editor Extensions
-- **[codemirror-vim](https://github.com/replit/codemirror-vim)** - Vim keybindings for CodeMirror
-- **[codemirror-helix](https://gitlab.com/_rvidal/codemirror-helix)** - Helix keybindings for CodeMirror
-- **[codemirror-emacs](https://github.com/replit/codemirror-emacs)** - Emacs keybindings for CodeMirror
-- **[codemirror-lang-typst](https://github.com/kxxt/codemirror-lang-typst)** - Typst language support for CodeMirror
-- **[uiw/codemirror-themes-all](https://github.com/uiwjs/react-codemirror/tree/master/themes/all)** - Collection of themes for CodeMirror
-- **[Milkdown](https://github.com/Milkdown/milkdown)** - A markdown editor built on top of [ProseMirror](https://prosemirror.net/) and [remark](https://github.com/remarkjs/remark)
-
-### LaTeX Tools
-- **[tex-fmt](https://github.com/WGUNDERWOOD/tex-fmt)** - LaTeX code formatter
-- **[TeXcount](https://app.uio.no/ifi/texcount/)** - Word counter for LaTeX documents
-- **[BibTeX-Tidy](https://github.com/FlamingTempura/bibtex-tidy)** - BibTeX file cleaner and formatter
-
-### Typst Tools
-- **[typstyle](https://github.com/typstyle-rs/typstyle)** - Typst code formatter
-- **[typst-wordometer](https://github.com/Jollywatt/typst-wordometer)** - Word counter for Typst documents
-
-### Diagram & Visualization
-- **[Draw.io](https://github.com/jgraph/drawio)** - Diagramming tool for collaborative diagram editing
-- **[TikZ Editor](https://github.com/DominikPeters/tikz-editor)** - WYSIWYG editor for TikZ diagrams in LaTeX with collaborative editing support
-- **[MathLive](https://github.com/arnog/mathlive)** - Math rendering and full editing with built-in symbol and expression keyboard
-- **[Detypify](https://github.com/QuarticCat/detypify)** - Handwritten symbol recognition powered by a client-side ONNX model, used for draw-to-insert symbol search
-
-### Runtime
-- **[WebPerl](https://github.com/haukex/webperl)** - Perl interpreter compiled to WebAssembly
-- **[wasm-bindgen](https://github.com/wasm-bindgen/wasm-bindgen)** - Rust/Wasm interoperability
-
-Third-party logo and icon attributions: http://texlyre.org/docs/attributions.
-
-### Generative AI
-
-Generative AI has been used for selected development and maintenance tasks, including scoped code changes, adaptation of existing integrations, debugging, refactoring, tests, and project configuration.
-
-The tools, interaction summaries, and AI-assisted development areas are documented in [`genai/`](genai/README.md).
-
-
-## Contributing 
-[Get started with TeXlyre](https://texlyre.org/texlyre/) 
-**or** 
-[contribute to the project with bug fixes, new features, plugins, and translations](CONTRIBUTING.md).
+All other features (real-time collaboration, in-browser LaTeX/Typst compilation, Git backups, plugins) are unchanged from upstream; see the [TeXlyre README](https://github.com/TeXlyre/texlyre#readme) and [docs](https://texlyre.org/docs).
 
 ## License
 
-TeXlyre is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0).
-See [LICENSE](LICENSE) for the complete license text.
-
-## Funding
-
-[TeXlyre is funded by NLnet](https://nlnet.nl/project/Texlyre/) through the NGI0 Commons Fund, which is supported by the European Commission's Next Generation Internet programme. 
-
-<p align="center">
-  <img src="showcase/sponsors_banner.svg"
-       alt="Funding agencies" width="100%">
-</p>
-
----
-
+AGPL-3.0, same as TeXlyre. This is a modified version of TeXlyre: the SFTP backup plugin (`extras/backup/sftp/`), the local bridge (`sftp-bridge/`), and small supporting changes were added in September 2026. All credit for TeXlyre itself goes to the [TeXlyre authors](https://github.com/TeXlyre/texlyre).

@@ -63,7 +63,7 @@ const config: TexlyreConfig = {
         loggers: ['latex_visualizer', 'typst_visualizer'],
         bibliography: ['zotero', 'openalex'], // 'jabref'
         lsp: [],
-        backup: ['github', 'gitlab', 'forgejo', 'gitea'],
+        backup: ['github', 'gitlab', 'forgejo', 'gitea', 'sftp'],
         themes: ['texlyre_slim', 'texlyre_wide', 'texlyre_mobile'],
     },
 

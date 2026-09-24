@@ -22,6 +22,7 @@ export default {
 		'backup/gitlab',
 		'backup/forgejo',
 		'backup/gitea',
+		'backup/sftp',
 		'themes/texlyre_slim',
 		'themes/texlyre_wide',
 		'themes/texlyre_mobile',
