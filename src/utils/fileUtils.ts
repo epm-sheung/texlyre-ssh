@@ -787,6 +787,34 @@ export function isLatexMainFile(pathOrName: string): boolean {
 	);
 }
 
+const DOCUMENTCLASS_RE = /^[^%\n]*\\documentclass/m;
+const MAIN_FILE_SCAN_LIMIT = 100;
+
+const pathDepth = (p: string) => p.split('/').filter(Boolean).length;
+const byDepthThenName = (a: string, b: string) =>
+	pathDepth(a) - pathDepth(b) || a.localeCompare(b);
+
+// Main document for "auto-detect", independent of which file is open (as in
+// Overleaf): main.tex (shallowest first), else a .tex file whose uncommented
+// source contains \documentclass. Returns undefined when neither exists, so
+// callers can fall back to the open file.
+export async function detectLatexMainFile(
+	texPaths: string[],
+	readText: (path: string) => Promise<string | undefined>,
+): Promise<string | undefined> {
+	const sorted = [...texPaths].sort(byDepthThenName);
+	const mainTex = sorted.find(
+		(p) => (p.split('/').pop() || '').toLowerCase() === 'main.tex',
+	);
+	if (mainTex) return mainTex;
+
+	for (const path of sorted.slice(0, MAIN_FILE_SCAN_LIMIT)) {
+		const text = await readText(path).catch(() => undefined);
+		if (text && DOCUMENTCLASS_RE.test(text)) return path;
+	}
+	return undefined;
+}
+
 export function isTypstFile(pathOrName: string): boolean {
 	if (!pathOrName) return false;
 	const lower = pathOrName.toLowerCase();

@@ -16,6 +16,7 @@ import type { DocumentList } from '../../types/documents';
 import type { FileNode } from '../../types/files';
 import type { LaTeXOutputFormat, LaTeXEngine } from '../../types/latex';
 import {
+	detectLatexMainFile,
 	getFilenameFromPath,
 	isLatexFile,
 	isLatexMainFile,
@@ -36,6 +37,12 @@ import {
 } from '../common/Icons';
 
 const moduleLog = createNamedLogger('LaTeXCompileButton');
+
+const readTexFile = async (path: string): Promise<string | undefined> => {
+	const content = (await fileStoreService.getFileByPath(path))?.content;
+	if (typeof content === 'string') return content;
+	return content ? new TextDecoder().decode(content) : undefined;
+};
 
 interface LaTeXCompileButtonProps {
 	dropdownKey: string;
@@ -250,6 +257,13 @@ const LaTeXCompileButton: React.FC<LaTeXCompileButtonProps> = ({
 		setAvailableTexFiles(allTexFiles);
 
 		const findMainFile = async () => {
+			// Compile the project's main document, not whichever file is open.
+			const detected = await detectLatexMainFile(allTexFiles, readTexFile);
+			if (detected) {
+				setAutoMainFile(detected);
+				return;
+			}
+
 			if (
 				selectedDocId &&
 				linkedFileInfo?.filePath &&

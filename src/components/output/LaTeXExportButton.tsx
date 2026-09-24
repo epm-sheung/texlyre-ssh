@@ -14,6 +14,7 @@ import type { LaTeXEngine } from '../../types/latex';
 import type { DocumentList } from '../../types/documents';
 import type { FileNode } from '../../types/files';
 import {
+	detectLatexMainFile,
 	getFilenameFromPath,
 	isLatexMainFile,
 	isTemporaryFile,
@@ -29,6 +30,12 @@ import {
 } from '../common/Icons';
 
 const moduleLog = createNamedLogger('LaTeXExportButton');
+
+const readTexFile = async (path: string): Promise<string | undefined> => {
+	const content = (await fileStoreService.getFileByPath(path))?.content;
+	if (typeof content === 'string') return content;
+	return content ? new TextDecoder().decode(content) : undefined;
+};
 
 interface LaTeXExportButtonProps {
 	className?: string;
@@ -221,6 +228,12 @@ const LaTeXExportButton: React.FC<LaTeXExportButtonProps> = ({
 		setAvailableTexFiles(allTexFiles);
 
 		const findMainFile = async () => {
+			// Same rule as the compile button: the main document, not the open file.
+			const detected = await detectLatexMainFile(allTexFiles, readTexFile);
+			if (detected) {
+				setAutoMainFile(detected);
+				return;
+			}
 			if (
 				selectedDocId &&
 				linkedFileInfo?.filePath &&

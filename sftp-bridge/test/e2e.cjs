@@ -548,10 +548,10 @@ async function main() {
 		path.join(remoteHome, 'scratch', 'paper', ...rel.split('/'));
 	const serverTree = {
 		'main.tex':
-			'\\documentclass{article}\n\\input{preamble}\n\\begin{document}\n\\input{sec/intro}\n\\end{document}\n',
-		'preamble.tex': '\\usepackage{amsmath}\n',
-		'main.bib': '@inproceedings{x, title={X}, year={2025}}\n',
-		'sec/intro.tex': 'Intro.\n',
+			'\\documentclass{article}\n\\input{header}\n\\begin{document}\n\\input{chapters/intro}\n\\end{document}\n',
+		'header.tex': '\\usepackage{amsmath}\n',
+		'refs.bib': '@inproceedings{x, title={X}, year={2025}}\n',
+		'chapters/intro.tex': 'Intro.\n',
 		'figs/teaser.png': rand(50 * 1024),
 		'main.aux': 'aux junk',
 		'build/main.pdf': 'pdf bytes',
@@ -569,11 +569,11 @@ async function main() {
 		assert.deepEqual(
 			r.files.map((f) => f.path),
 			[
+				'chapters/intro.tex',
 				'figs/teaser.png',
-				'main.bib',
+				'header.tex',
 				'main.tex',
-				'preamble.tex',
-				'sec/intro.tex',
+				'refs.bib',
 			],
 		);
 		assert.deepEqual(r.skipped.excluded.sort(), ['.git', 'build', 'main.aux']);
@@ -600,7 +600,7 @@ async function main() {
 			'BAD_PATH',
 		);
 		await expectError(
-			c.request('get', { remoteDir: EXIST, path: '/sec' }),
+			c.request('get', { remoteDir: EXIST, path: '/chapters' }),
 			'NOT_A_FILE',
 		);
 	});
@@ -616,11 +616,14 @@ async function main() {
 		return `adopted=${result.adopted} uploaded=${result.uploaded}`;
 	});
 	await step('edit after import uploads just that file', async () => {
-		imported.set('sec/intro.tex', Buffer.from('Intro, edited in TeXlyre.\n'));
+		imported.set(
+			'chapters/intro.tex',
+			Buffer.from('Intro, edited in TeXlyre.\n'),
+		);
 		const { plan } = await push(c, EXIST, imported);
-		assert.deepEqual(plan.upload, ['sec/intro.tex']);
+		assert.deepEqual(plan.upload, ['chapters/intro.tex']);
 		assert.equal(
-			fs.readFileSync(existPath('sec/intro.tex'), 'utf8'),
+			fs.readFileSync(existPath('chapters/intro.tex'), 'utf8'),
 			'Intro, edited in TeXlyre.\n',
 		);
 	});
@@ -665,9 +668,9 @@ async function main() {
 		});
 		assert.deepEqual(
 			paper.dirs.map((d) => d.name),
-			['.git', 'build', 'figs', 'sec'],
+			['.git', 'build', 'chapters', 'figs'],
 		);
-		assert.equal(paper.files, 5); // main.tex, main.bib, main.aux, preamble.tex, .texlyre-sync.json
+		assert.equal(paper.files, 5); // main.tex, refs.bib, main.aux, header.tex, .texlyre-sync.json
 		await expectError(
 			c.request('dirs', { remoteDir: 'nope/nothing' }),
 			'NOT_FOUND',
@@ -680,16 +683,16 @@ async function main() {
 	});
 	await step('touch-only mtime drift is not a conflict', async () => {
 		const future = new Date(Date.now() + 3600e3);
-		fs.utimesSync(existPath('main.bib'), future, future); // content unchanged
-		fs.utimesSync(existPath('preamble.tex'), future, future);
+		fs.utimesSync(existPath('refs.bib'), future, future); // content unchanged
+		fs.utimesSync(existPath('header.tex'), future, future);
 		imported.set(
-			'main.bib',
+			'refs.bib',
 			Buffer.from('@inproceedings{x, title={X2}, year={2025}}\n'),
 		);
 		const { plan } = await push(c, EXIST, imported);
-		assert.deepEqual(plan.upload, ['main.bib']);
+		assert.deepEqual(plan.upload, ['refs.bib']);
 		assert.deepEqual(plan.conflicts, []);
-		assert.equal(plan.adopted, 1); // preamble.tex re-tracked with its new mtime
+		assert.equal(plan.adopted, 1); // header.tex re-tracked with its new mtime
 		const again = await push(c, EXIST, imported);
 		assert.equal(
 			again.plan.upload.length +
